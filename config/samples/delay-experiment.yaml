@@ -1,0 +1,34 @@
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: payment-service-network-delay
+  namespace: production
+spec:
+  target:
+    labelSelector:
+      app: payment-service
+      tier: api
+    namespace: production
+    percentage: 33       # Affect 1 in 3 pods
+    mode: random
+
+  fault:
+    type: NetworkDelay
+    networkDelay:
+      latencyMs: 300     # 300ms added latency
+      jitterMs: 50       # ±50ms jitter
+      correlation: 25    # 25% correlation between successive packets
+
+  duration: 10m
+  cooldown: 10m
+
+  safetyGates:
+    - type: SLOBurnRate
+      service: payment-service
+      threshold: "3x"    # Abort if burn rate exceeds 3x (before page threshold)
+
+    - type: ErrorRate
+      service: payment-service
+      threshold: "2"     # Abort if error rate exceeds 2%
+
+  dryRun: false          # Set to true to validate targeting without injecting

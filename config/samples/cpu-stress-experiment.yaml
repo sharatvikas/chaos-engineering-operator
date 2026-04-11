@@ -1,0 +1,40 @@
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: auth-service-cpu-stress
+  namespace: production
+spec:
+  target:
+    labelSelector:
+      app: auth-service
+    namespace: production
+    percentage: 25       # Stress 1 pod at a time
+    mode: random
+
+  fault:
+    type: CPUStress
+    cpuStress:
+      workers: 2         # Number of stress-ng CPU workers
+      load: 80           # 80% CPU load per worker
+
+  duration: 15m
+  cooldown: 15m
+
+  safetyGates:
+    - type: SLOBurnRate
+      service: auth-service
+      threshold: "6x"    # Slow burn threshold
+
+    - type: ErrorRate
+      service: auth-service
+      threshold: "1"
+
+    # Custom Prometheus query gate — block if downstream services are already degraded
+    - type: Custom
+      prometheusQuery: |
+        sum(rate(http_requests_total{status=~"5..",job="api-gateway"}[5m]))
+        /
+        sum(rate(http_requests_total{job="api-gateway"}[5m])) * 100
+      threshold: "3"
+
+  dryRun: false
