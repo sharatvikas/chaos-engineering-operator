@@ -1,0 +1,139 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: chaosexperiments.chaos.sharatvikas.io
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+spec:
+  group: chaos.sharatvikas.io
+  names:
+    kind: ChaosExperiment
+    listKind: ChaosExperimentList
+    plural: chaosexperiments
+    singular: chaosexperiment
+    shortNames:
+      - chaos
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Fault
+          type: string
+          jsonPath: .spec.fault.type
+        - name: Targets
+          type: integer
+          jsonPath: .status.targetedPods
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: ["target", "fault", "duration"]
+              properties:
+                target:
+                  type: object
+                  required: ["labelSelector"]
+                  properties:
+                    labelSelector:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    namespace:
+                      type: string
+                    percentage:
+                      type: integer
+                      minimum: 1
+                      maximum: 100
+                      default: 25
+                    mode:
+                      type: string
+                      enum: ["random", "all", "fixed"]
+                      default: random
+                fault:
+                  type: object
+                  required: ["type"]
+                  properties:
+                    type:
+                      type: string
+                      enum: ["PodKill", "CPUStress", "MemoryStress", "NetworkDelay", "NetworkLoss"]
+                    podKill:
+                      type: object
+                      properties:
+                        gracePeriodSeconds:
+                          type: integer
+                          default: 0
+                    cpuStress:
+                      type: object
+                      properties:
+                        workers:
+                          type: integer
+                          default: 1
+                        load:
+                          type: integer
+                          minimum: 1
+                          maximum: 100
+                          default: 80
+                    memoryStress:
+                      type: object
+                      properties:
+                        workers:
+                          type: integer
+                          default: 1
+                        bytes:
+                          type: string
+                          default: "256M"
+                duration:
+                  type: string
+                  pattern: '^[0-9]+(s|m|h)$'
+                cooldown:
+                  type: string
+                  pattern: '^[0-9]+(s|m|h)$'
+                  default: "5m"
+                dryRun:
+                  type: boolean
+                  default: false
+                safetyGates:
+                  type: array
+                  items:
+                    type: object
+                    required: ["type", "threshold"]
+                    properties:
+                      type:
+                        type: string
+                        enum: ["SLOBurnRate", "ErrorRate", "Availability", "Custom"]
+                      service:
+                        type: string
+                      threshold:
+                        type: string
+                      prometheusQuery:
+                        type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                startTime:
+                  type: string
+                  format: date-time
+                endTime:
+                  type: string
+                  format: date-time
+                targetedPods:
+                  type: integer
+                abortReason:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object

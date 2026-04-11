@@ -1,0 +1,57 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/sharatvikas/chaos-engineering-operator
+  pullPolicy: IfNotPresent
+  tag: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Prometheus URL for safety gate evaluation
+prometheusURL: "http://prometheus-operated.monitoring.svc.cluster.local:9090"
+
+# Global safety defaults — can be overridden per ChaosExperiment
+safety:
+  # Abort if SLO burn rate exceeds this threshold
+  defaultBurnRateThreshold: "5x"
+  # Abort if error rate exceeds this percentage
+  defaultErrorRateThreshold: "5"
+  # Never run experiments outside these hours (24h UTC)
+  allowedHours:
+    start: "09"
+    end: "17"
+  # Never run on these days
+  blockedDays: ["Saturday", "Sunday"]
+
+# Namespace where the operator watches for ChaosExperiment CRs
+# Empty string = watch all namespaces
+watchNamespace: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+leaderElection:
+  enabled: true
+
+metrics:
+  enabled: true
+  port: 8080
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+
+rbac:
+  create: true
+crds:
+  install: true
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
