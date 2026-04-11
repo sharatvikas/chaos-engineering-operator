@@ -1,0 +1,27 @@
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: recommendation-service-pod-kill
+  namespace: staging
+spec:
+  target:
+    labelSelector:
+      app: recommendation-service
+    namespace: staging
+    percentage: 50       # Kill half the pods to test autoscaler response
+    mode: random
+
+  fault:
+    type: PodKill
+    podKill:
+      gracePeriodSeconds: 0   # Hard kill — simulates node failure
+
+  duration: 5m
+  cooldown: 5m
+
+  safetyGates:
+    - type: Availability
+      service: recommendation-service
+      threshold: "99.0"  # Abort if availability drops below 99%
+
+  dryRun: false
