@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -15,214 +18,191 @@ import (
 	"github.com/sharatvikas/chaos-engineering-operator/internal/safety"
 )
 
+const (
+	requeueRunning  = 15 * time.Second
+	requeuePending  = 5 * time.Second
+	requeueCooldown = 30 * time.Second
+)
+
 // ChaosExperimentReconciler reconciles ChaosExperiment objects
 type ChaosExperimentReconciler struct {
 	client.Client
-	Scheme         *runtime.Scheme
-	PrometheusURL  string
-	SlackWebhook   string
+	Scheme        *runtime.Scheme
+	PrometheusURL string
 }
 
 // +kubebuilder:rbac:groups=chaos.sharatvikas.io,resources=chaosexperiments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=chaos.sharatvikas.io,resources=chaosexperiments/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;delete;create
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *ChaosExperimentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	var experiment chaosv1alpha1.ChaosExperiment
-	if err := r.Get(ctx, req.NamespacedName, &experiment); err != nil {
+	var exp chaosv1alpha1.ChaosExperiment
+	if err := r.Get(ctx, req.NamespacedName, &exp); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	logger.Info("Reconciling ChaosExperiment",
-		"name", experiment.Name,
-		"phase", experiment.Status.Phase,
-		"fault", experiment.Spec.Fault.Type,
-	)
-
-	switch experiment.Status.Phase {
-	case "", chaosv1alpha1.PhasePending:
-		return r.handlePending(ctx, &experiment)
-	case chaosv1alpha1.PhasePreflightCheck:
-		return r.handlePreflightCheck(ctx, &experiment)
-	case chaosv1alpha1.PhaseRunning:
-		return r.handleRunning(ctx, &experiment)
-	case chaosv1alpha1.PhaseCompleted, chaosv1alpha1.PhaseAborted, chaosv1alpha1.PhaseFailed:
-		// Terminal states — nothing to do
+	switch exp.Status.Phase {
+	case "", "Pending":
+		return r.handlePending(ctx, &exp)
+	case "PreflightCheck":
+		return r.handlePreflightCheck(ctx, &exp)
+	case "Running":
+		return r.handleRunning(ctx, &exp)
+	case "Cooldown":
+		return r.handleCooldown(ctx, &exp)
+	case "Completed", "Aborted":
+		logger.Info("experiment is terminal", "phase", exp.Status.Phase)
 		return ctrl.Result{}, nil
+	default:
+		logger.Info("unknown phase, resetting", "phase", exp.Status.Phase)
+		return r.setPhase(ctx, &exp, "Pending")
 	}
-
-	return ctrl.Result{}, nil
 }
 
-func (r *ChaosExperimentReconciler) handlePending(
-	ctx context.Context, exp *chaosv1alpha1.ChaosExperiment,
-) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-	logger.Info("Starting preflight check", "experiment", exp.Name)
-
-	exp.Status.Phase = chaosv1alpha1.PhasePreflightCheck
-	if err := r.Status().Update(ctx, exp); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{Requeue: true}, nil
+func (r *ChaosExperimentReconciler) handlePending(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment) (ctrl.Result, error) {
+	log.FromContext(ctx).Info("experiment pending, starting preflight")
+	return r.setPhase(ctx, exp, "PreflightCheck")
 }
 
-func (r *ChaosExperimentReconciler) handlePreflightCheck(
-	ctx context.Context, exp *chaosv1alpha1.ChaosExperiment,
-) (ctrl.Result, error) {
+func (r *ChaosExperimentReconciler) handlePreflightCheck(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+	checker := safety.NewGateChecker(r.PrometheusURL)
 
-	// Check that the target SLOs are healthy before we start
-	if len(exp.Spec.SafetyGates) > 0 {
-		checker := safety.NewGateChecker(r.PrometheusURL)
-		for _, gate := range exp.Spec.SafetyGates {
-			ok, reason, err := checker.Check(ctx, gate)
-			if err != nil {
-				logger.Error(err, "Safety gate check failed", "gate", gate.Type)
-				continue
-			}
-			if !ok {
-				logger.Info("Preflight safety gate not satisfied — postponing", "reason", reason)
-				exp.Status.Phase = chaosv1alpha1.PhasePending
-				if err := r.Status().Update(ctx, exp); err != nil {
-					return ctrl.Result{}, err
-				}
-				// Retry in 5 minutes
-				return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
-			}
+	for _, gate := range exp.Spec.SafetyGates {
+		safe, reason, err := checker.Check(ctx, gate)
+		if err != nil {
+			logger.Error(err, "gate check error — failing open", "gate", gate.Type)
+			continue
+		}
+		if !safe {
+			logger.Info("safety gate blocked experiment", "gate", gate.Type, "reason", reason)
+			return r.abort(ctx, exp, fmt.Sprintf("gate %s blocked: %s", gate.Type, reason))
 		}
 	}
-
-	// All gates passed — start the experiment
-	now := metaTime()
-	exp.Status.Phase = chaosv1alpha1.PhaseRunning
-	exp.Status.StartTime = &now
 
 	if exp.Spec.DryRun {
-		logger.Info("DRY RUN — would start fault injection", "type", exp.Spec.Fault.Type)
-		exp.Status.Phase = chaosv1alpha1.PhaseCompleted
-		exp.Status.Report = fmt.Sprintf("Dry run completed. Would have injected %s fault.", exp.Spec.Fault.Type)
-		return ctrl.Result{}, r.Status().Update(ctx, exp)
+		logger.Info("dry run — skipping fault injection")
+		return r.setPhase(ctx, exp, "Completed")
 	}
-
-	// Select target pods
-	targets, err := faults.SelectTargets(ctx, r.Client, exp.Spec.Target)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to select targets: %w", err)
-	}
-
-	exp.Status.TargetedPods = targets
-	if err := r.Status().Update(ctx, exp); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	// Start fault injection (non-blocking — controller will monitor via requeue)
-	executor := faults.NewExecutor(r.Client)
-	if err := executor.Start(ctx, exp, targets); err != nil {
-		exp.Status.Phase = chaosv1alpha1.PhaseFailed
-		r.Status().Update(ctx, exp)
-		return ctrl.Result{}, fmt.Errorf("fault injection failed to start: %w", err)
-	}
-
-	logger.Info("Fault injection started",
-		"type", exp.Spec.Fault.Type,
-		"targets", len(targets),
-		"duration", exp.Spec.Duration,
-	)
-
-	// Parse duration and requeue at experiment end
-	duration, _ := time.ParseDuration(exp.Spec.Duration)
-	return ctrl.Result{RequeueAfter: duration}, r.Status().Update(ctx, exp)
+	return r.startFaults(ctx, exp)
 }
 
-func (r *ChaosExperimentReconciler) handleRunning(
-	ctx context.Context, exp *chaosv1alpha1.ChaosExperiment,
-) (ctrl.Result, error) {
+func (r *ChaosExperimentReconciler) startFaults(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
+	executor := faults.NewExecutor(r.Client)
+
+	count, err := executor.Start(ctx, exp)
+	if err != nil {
+		return r.abort(ctx, exp, fmt.Sprintf("fault injection failed: %v", err))
+	}
+
+	logger.Info("faults injected", "type", exp.Spec.Fault.Type, "pods", count)
+
+	patch := client.MergeFrom(exp.DeepCopy())
+	now := metav1.Now()
+	exp.Status.Phase = "Running"
+	exp.Status.StartTime = &now
+	exp.Status.TargetedPods = count
+	meta.SetStatusCondition(&exp.Status.Conditions, metav1.Condition{
+		Type:               "Running",
+		Status:             metav1.ConditionTrue,
+		Reason:             "FaultInjected",
+		Message:            fmt.Sprintf("%s on %d pods", exp.Spec.Fault.Type, count),
+		LastTransitionTime: now,
+	})
+
+	duration, _ := parseDuration(exp.Spec.Duration)
+	return ctrl.Result{RequeueAfter: duration}, r.Status().Patch(ctx, exp, patch)
+}
+
+func (r *ChaosExperimentReconciler) handleRunning(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	// Check safety gates while running
-	if len(exp.Spec.SafetyGates) > 0 {
-		checker := safety.NewGateChecker(r.PrometheusURL)
-		for _, gate := range exp.Spec.SafetyGates {
-			ok, reason, err := checker.Check(ctx, gate)
-			if err != nil {
-				logger.Error(err, "Safety gate check error during experiment", "gate", gate.Type)
-				continue
-			}
-			if !ok {
-				logger.Info("Safety gate triggered — aborting experiment", "reason", reason)
-				return r.abortExperiment(ctx, exp, reason)
-			}
+	// Mid-experiment gate evaluation — abort if SLOs degrade
+	checker := safety.NewGateChecker(r.PrometheusURL)
+	for _, gate := range exp.Spec.SafetyGates {
+		safe, reason, err := checker.Check(ctx, gate)
+		if err != nil {
+			continue
+		}
+		if !safe {
+			logger.Info("mid-experiment gate tripped — aborting", "gate", gate.Type, "reason", reason)
+			_ = faults.NewExecutor(r.Client).Stop(ctx, exp)
+			return r.abort(ctx, exp, fmt.Sprintf("mid-experiment gate %s: %s", gate.Type, reason))
 		}
 	}
 
-	// Check if experiment duration has elapsed
-	if exp.Status.StartTime != nil {
-		duration, err := time.ParseDuration(exp.Spec.Duration)
-		if err == nil {
-			elapsed := time.Since(exp.Status.StartTime.Time)
-			if elapsed >= duration {
-				return r.completeExperiment(ctx, exp)
-			}
-			// Check again in 10 seconds (for safety gate polling)
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	duration, _ := parseDuration(exp.Spec.Duration)
+	if exp.Status.StartTime != nil && time.Since(exp.Status.StartTime.Time) >= duration {
+		logger.Info("duration elapsed — stopping faults")
+		if err := faults.NewExecutor(r.Client).Stop(ctx, exp); err != nil {
+			logger.Error(err, "fault cleanup error — manual cleanup may be required")
 		}
+		return r.setPhase(ctx, exp, "Cooldown")
 	}
 
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+	return ctrl.Result{RequeueAfter: requeueRunning}, nil
 }
 
-func (r *ChaosExperimentReconciler) abortExperiment(
-	ctx context.Context, exp *chaosv1alpha1.ChaosExperiment, reason string,
-) (ctrl.Result, error) {
-	log.FromContext(ctx).Info("Aborting experiment", "reason", reason)
+func (r *ChaosExperimentReconciler) handleCooldown(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment) (ctrl.Result, error) {
+	cooldown, _ := parseDuration(exp.Spec.Cooldown)
+	if cooldown == 0 {
+		cooldown = 5 * time.Minute
+	}
 
-	executor := faults.NewExecutor(r.Client)
-	executor.Stop(ctx, exp)
+	stopTime := time.Now()
+	if exp.Status.EndTime != nil {
+		stopTime = exp.Status.EndTime.Time
+	}
 
-	now := metaTime()
-	exp.Status.Phase = chaosv1alpha1.PhaseAborted
-	exp.Status.EndTime = &now
+	if time.Since(stopTime) < cooldown {
+		return ctrl.Result{RequeueAfter: cooldown - time.Since(stopTime)}, nil
+	}
+	return r.setPhase(ctx, exp, "Completed")
+}
+
+func (r *ChaosExperimentReconciler) abort(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment, reason string) (ctrl.Result, error) {
+	patch := client.MergeFrom(exp.DeepCopy())
+	now := metav1.Now()
+	exp.Status.Phase = "Aborted"
 	exp.Status.AbortReason = reason
-
-	return ctrl.Result{}, r.Status().Update(ctx, exp)
+	exp.Status.EndTime = &now
+	meta.SetStatusCondition(&exp.Status.Conditions, metav1.Condition{
+		Type:               "Running",
+		Status:             metav1.ConditionFalse,
+		Reason:             "Aborted",
+		Message:            reason,
+		LastTransitionTime: now,
+	})
+	return ctrl.Result{}, r.Status().Patch(ctx, exp, patch)
 }
 
-func (r *ChaosExperimentReconciler) completeExperiment(
-	ctx context.Context, exp *chaosv1alpha1.ChaosExperiment,
-) (ctrl.Result, error) {
-	log.FromContext(ctx).Info("Experiment completed successfully")
-
-	executor := faults.NewExecutor(r.Client)
-	executor.Stop(ctx, exp)
-
-	now := metaTime()
-	exp.Status.Phase = chaosv1alpha1.PhaseCompleted
-	exp.Status.EndTime = &now
-
-	duration := now.Time.Sub(exp.Status.StartTime.Time)
-	exp.Status.Report = fmt.Sprintf(
-		"Experiment completed. Fault: %s. Duration: %s. Targets affected: %d.",
-		exp.Spec.Fault.Type, duration.Round(time.Second), len(exp.Status.TargetedPods),
-	)
-
-	return ctrl.Result{}, r.Status().Update(ctx, exp)
+func (r *ChaosExperimentReconciler) setPhase(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment, phase string) (ctrl.Result, error) {
+	patch := client.MergeFrom(exp.DeepCopy())
+	exp.Status.Phase = phase
+	if phase == "Completed" {
+		now := metav1.Now()
+		exp.Status.EndTime = &now
+	}
+	requeue := map[string]time.Duration{
+		"Pending": requeuePending, "PreflightCheck": requeuePending, "Cooldown": requeueCooldown,
+	}[phase]
+	return ctrl.Result{RequeueAfter: requeue}, r.Status().Patch(ctx, exp, patch)
 }
 
 func (r *ChaosExperimentReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&chaosv1alpha1.ChaosExperiment{}).
-		Complete(r)
+	return ctrl.NewControllerManagedBy(mgr).For(&chaosv1alpha1.ChaosExperiment{}).Complete(r)
 }
 
-func metaTime() metav1Time {
-	return metav1Time{Time: time.Now()}
+func parseDuration(s string) (time.Duration, error) {
+	if s == "" {
+		return 5 * time.Minute, nil
+	}
+	return time.ParseDuration(s)
 }
 
-// metav1Time is an alias to avoid import cycle in this snippet
-type metav1Time = interface{ Time time.Time }
+// Ensure corev1 is used (for EventTypeWarning in event recording)
+var _ = corev1.EventTypeWarning
