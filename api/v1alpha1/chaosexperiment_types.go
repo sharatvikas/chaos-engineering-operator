@@ -214,6 +214,18 @@ type ChaosExperimentStatus struct {
 	// Report contains the experiment summary report
 	// +optional
 	Report string `json:"report,omitempty"`
+
+	// LastScheduledTime is the last time the schedule triggered a run
+	// +optional
+	LastScheduledTime *metav1.Time `json:"lastScheduledTime,omitempty"`
+
+	// BlockedReason describes why a dry-run was blocked by safety gates
+	// +optional
+	BlockedReason string `json:"blockedReason,omitempty"`
+
+	// DryRunReport contains the dry-run simulation summary
+	// +optional
+	DryRunReport string `json:"dryRunReport,omitempty"`
 }
 
 // +kubebuilder:object:root=true
