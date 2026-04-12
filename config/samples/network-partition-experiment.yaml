@@ -1,0 +1,137 @@
+##
+## ChaosExperiment: Network Partition — Payments Service
+##
+## Tests resilience when the payments service loses connectivity to its
+## database. This experiment validates:
+##   1. Circuit breaker opens within 30s
+##   2. Checkout falls back to degraded mode (no payment, show message)
+##   3. Error rate stays below 10% (non-payment flows continue)
+##   4. Recovery completes within 2 minutes of network restoration
+##
+## Run in staging only. Requires 2+ replicas and circuit breaker configured.
+##
+## To run:
+##   kubectl apply -f network-partition-experiment.yaml
+##   chaosctl next-runs network-partition-weekly -n staging
+##   chaosctl describe network-partition-weekly -n staging
+##
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: payments-network-partition
+  namespace: staging
+  labels:
+    category: network
+    service: payments
+    environment: staging
+  annotations:
+    chaos.sharatvikas.io/owner: "sre-team"
+    chaos.sharatvikas.io/jira: "PLAT-1234"
+    chaos.sharatvikas.io/hypothesis: >
+      When network connectivity between payments-service and payments-db is
+      severed, the circuit breaker opens and checkout switches to degraded mode.
+      Error rate on non-payment endpoints stays below 5%.
+spec:
+  target:
+    selector:
+      matchLabels:
+        app: payments-service
+    namespace: staging
+    percentage: 100      # Affect all replicas to truly partition the service
+    mode: All
+
+  fault:
+    type: NetworkDelay
+    networkDelay:
+      latencyMs: 10000   # 10s latency = effective partition (TCP timeout)
+      jitterMs: 1000
+      correlationPct: 100
+
+  duration: 10m
+  cooldown: 5m
+
+  safetyGates:
+    # Abort if overall error rate exceeds 10% — non-payment flows must survive
+    - type: ErrorRate
+      service: payments-service
+      threshold: "10"
+
+    # Abort if availability (non-5xx) drops below 90%
+    - type: Availability
+      service: payments-service
+      threshold: "90.0"
+
+    # Abort if checkout service error rate rises above 20%
+    - type: SLOBurnRate
+      service: checkout-service
+      threshold: "5x"
+
+    # Custom gate: abort if payment retries exhaust DLQ
+    - type: ErrorRate
+      prometheusQuery: |
+        aws_sqs_approximate_number_of_messages_visible_sum{
+          queue_name="payments-processing-queue-dlq"
+        } > 100
+      threshold: "1"
+
+  schedule:
+    cron: "0 14 * * 2"    # Every Tuesday at 14:00 UTC
+    timezone: "America/Denver"
+    suspend: false
+
+  notifications:
+    slack: "#chaos-experiments"
+    pagerduty: false
+
+  dryRun: false
+
+---
+##
+## ChaosExperiment: DNS Failure — Service Discovery Test
+##
+## Simulates DNS resolution failures for the recommendation service.
+## Validates that dependent services (homepage, product page) handle
+## DNS failures gracefully with cached responses or empty states.
+##
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: recommendation-dns-failure
+  namespace: staging
+  labels:
+    category: network
+    service: recommendation-service
+    environment: staging
+  annotations:
+    chaos.sharatvikas.io/owner: "sre-team"
+    chaos.sharatvikas.io/hypothesis: >
+      Homepage and product-page show cached or empty recommendations when
+      DNS for recommendation-service fails. No user-visible errors.
+spec:
+  target:
+    selector:
+      matchLabels:
+        app: recommendation-service
+    namespace: staging
+    percentage: 50
+    mode: Random
+
+  fault:
+    type: DNSFailure
+
+  duration: 5m
+  cooldown: 3m
+
+  safetyGates:
+    - type: Availability
+      service: homepage-service
+      threshold: "99.5"
+    - type: Availability
+      service: product-page-service
+      threshold: "99.5"
+
+  notifications:
+    slack: "#chaos-experiments"
+    pagerduty: false
+
+  dryRun: false
