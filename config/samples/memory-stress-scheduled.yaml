@@ -1,0 +1,153 @@
+##
+## ChaosExperiment: Memory Stress — Scheduled Weekly
+##
+## Tests OOM kill behavior and Pod restart recovery for the analytics service.
+## This experiment validates:
+##   1. Pod restarts within 60 seconds after OOM kill
+##   2. HPA does NOT scale down during memory stress
+##   3. Adjacent services (reporting, dashboard) are unaffected
+##   4. Memory limits are set correctly (container OOMKilled, not node)
+##
+## Hypothesis: Memory limits are correctly set at 80% of node available memory.
+## The analytics service handles OOM kills gracefully without data loss.
+##
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: analytics-memory-stress-weekly
+  namespace: production
+  labels:
+    category: resource
+    service: analytics-service
+    environment: production
+    chaos.sharatvikas.io/approved: "true"
+  annotations:
+    chaos.sharatvikas.io/owner: "platform-team"
+    chaos.sharatvikas.io/approver: "sre-lead"
+    chaos.sharatvikas.io/hypothesis: >
+      When analytics-service memory is stressed to 90% of its limit, the
+      container is OOM-killed before it can stress the node. The pod restarts
+      within 60s, and Prometheus data ingestion lag remains below 30s.
+    chaos.sharatvikas.io/rollback: >
+      If experiment causes node memory pressure, increase node pool or
+      reduce analytics replica count temporarily.
+spec:
+  target:
+    selector:
+      matchLabels:
+        app: analytics-service
+        component: ingestor
+    namespace: production
+    percentage: 25      # Only 1 of 4 replicas — production-safe
+    mode: Random
+
+  fault:
+    type: MemoryStress
+    memoryStress:
+      fillPercentage: 90   # Fill 90% of container's memory limit
+
+  duration: 8m
+  cooldown: 10m
+
+  safetyGates:
+    # Abort if Prometheus ingestion lag exceeds 30s
+    - type: ErrorRate
+      prometheusQuery: |
+        prometheus_remote_storage_samples_pending > 50000
+      threshold: "1"
+
+    # Abort if analytics API error rate spikes
+    - type: ErrorRate
+      service: analytics-service
+      threshold: "5"
+
+    # Abort if NODE memory usage (not container) exceeds 85%
+    # This means our container limits may be too high
+    - type: ErrorRate
+      prometheusQuery: |
+        (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) * 100 > 85
+      threshold: "1"
+
+    # Abort if HPA is scaling down during stress (means HPA is misconfigured)
+    - type: ErrorRate
+      prometheusQuery: |
+        kube_horizontalpodautoscaler_status_current_replicas{
+          horizontalpodautoscaler="analytics-service"
+        }
+        < kube_horizontalpodautoscaler_spec_min_replicas{
+          horizontalpodautoscaler="analytics-service"
+        }
+      threshold: "1"
+
+  schedule:
+    cron: "0 3 * * 6"     # Every Saturday at 03:00 UTC (low traffic)
+    timezone: "UTC"
+    suspend: false
+
+  notifications:
+    slack: "#chaos-experiments"
+    pagerduty: true        # Page if safety gates trigger in production
+
+  dryRun: false
+
+---
+##
+## ChaosExperiment: CPU Stress — API Gateway Load Test
+##
+## Validates that the API gateway handles CPU saturation gracefully:
+## - Rate limiting kicks in (429s) before 5xx errors appear
+## - HPA scales up within 3 minutes
+## - p99 latency stays below 2s even under stress
+##
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: api-gateway-cpu-stress
+  namespace: staging
+  labels:
+    category: resource
+    service: api-gateway
+    environment: staging
+  annotations:
+    chaos.sharatvikas.io/owner: "platform-team"
+    chaos.sharatvikas.io/hypothesis: >
+      Under CPU saturation, the API gateway starts rate limiting at 80% CPU
+      (429 responses) before dropping connections (5xx). HPA scales within 3 min.
+spec:
+  target:
+    selector:
+      matchLabels:
+        app: api-gateway
+    namespace: staging
+    percentage: 50      # Stress half the replicas
+    mode: Random
+
+  fault:
+    type: CPUStress
+    cpuStress:
+      cores: 2
+      load: 90
+
+  duration: 15m
+  cooldown: 5m
+
+  safetyGates:
+    # Must not exceed 5% 5xx rate — rate limiting should absorb pressure
+    - type: ErrorRate
+      service: api-gateway
+      threshold: "5"
+
+    # p99 latency must stay below 2s
+    - type: ErrorRate
+      prometheusQuery: |
+        histogram_quantile(0.99,
+          sum(rate(http_request_duration_seconds_bucket{service="api-gateway"}[5m]))
+          by (le)
+        ) > 2
+      threshold: "1"
+
+  notifications:
+    slack: "#chaos-experiments"
+    pagerduty: false
+
+  dryRun: false
