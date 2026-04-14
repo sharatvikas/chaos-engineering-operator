@@ -1,12 +1,17 @@
 package faults
 
+// pod_kill.go — PodKill, CPUStress, and MemoryStress fault methods on Executor.
+// Executor struct and lifecycle (Start/Stop/SelectTargets) are in executor.go.
+
 import (
 	"context"
 	"fmt"
 	"math/rand"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -14,206 +19,102 @@ import (
 	chaosv1alpha1 "github.com/sharatvikas/chaos-engineering-operator/api/v1alpha1"
 )
 
-// Executor manages fault injection lifecycle
-type Executor struct {
-	client client.Client
-}
-
-// NewExecutor creates a new fault executor
-func NewExecutor(c client.Client) *Executor {
-	return &Executor{client: c}
-}
-
-// SelectTargets selects pods matching the experiment target spec
-func SelectTargets(
-	ctx context.Context,
-	c client.Client,
-	target chaosv1alpha1.TargetSpec,
-) ([]string, error) {
-	selector, err := metav1.LabelSelectorAsSelector(&target.Selector)
-	if err != nil {
-		return nil, fmt.Errorf("invalid label selector: %w", err)
-	}
-
-	var podList corev1.PodList
-	if err := c.List(ctx, &podList,
-		client.InNamespace(target.Namespace),
-		client.MatchingLabelsSelector{Selector: selector},
-	); err != nil {
-		return nil, fmt.Errorf("failed to list pods: %w", err)
-	}
-
-	// Filter to only Running pods
-	var running []corev1.Pod
-	for _, pod := range podList.Items {
-		if pod.Status.Phase == corev1.PodRunning {
-			running = append(running, pod)
-		}
-	}
-
-	if len(running) == 0 {
-		return nil, fmt.Errorf("no running pods found matching selector in namespace %s", target.Namespace)
-	}
-
-	// Apply percentage / mode selection
-	count := max(1, (len(running)*target.Percentage)/100)
-	selected := selectPods(running, count, target.Mode)
-
-	names := make([]string, len(selected))
-	for i, p := range selected {
-		names[i] = p.Name
-	}
-	return names, nil
-}
-
-func selectPods(pods []corev1.Pod, count int, mode string) []corev1.Pod {
-	switch mode {
-	case "All":
-		return pods
-	case "Fixed":
-		if count > len(pods) {
-			count = len(pods)
-		}
-		return pods[:count]
-	default: // Random
-		shuffled := make([]corev1.Pod, len(pods))
-		copy(shuffled, pods)
-		rand.Shuffle(len(shuffled), func(i, j int) {
-			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-		})
-		if count > len(shuffled) {
-			count = len(shuffled)
-		}
-		return shuffled[:count]
-	}
-}
-
-// Start begins fault injection for the given experiment and targets
-func (e *Executor) Start(
-	ctx context.Context,
-	exp *chaosv1alpha1.ChaosExperiment,
-	targets []string,
-) error {
+func (e *Executor) startPodKill(ctx context.Context, targets []corev1.Pod, _ *struct{}) error {
 	logger := log.FromContext(ctx)
+	gracePeriod := int64(0)
 
-	switch exp.Spec.Fault.Type {
-	case chaosv1alpha1.FaultPodKill:
-		return e.startPodKill(ctx, exp.Spec.Target.Namespace, targets, logger)
-	case chaosv1alpha1.FaultCPUStress:
-		return e.startCPUStress(ctx, exp, targets)
-	case chaosv1alpha1.FaultMemoryStress:
-		return e.startMemoryStress(ctx, exp, targets)
-	default:
-		return fmt.Errorf("unsupported fault type: %s", exp.Spec.Fault.Type)
-	}
-}
-
-// Stop terminates any ongoing fault injection (best-effort cleanup)
-func (e *Executor) Stop(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment) {
-	logger := log.FromContext(ctx)
-	logger.Info("Stopping fault injection", "type", exp.Spec.Fault.Type)
-	// For PodKill: pods self-recover via ReplicaSet controller
-	// For stress faults: delete the stress pods/sidecars
-	// Implementation depends on fault type
-}
-
-func (e *Executor) startPodKill(
-	ctx context.Context,
-	namespace string,
-	targets []string,
-	logger interface{ Info(string, ...any) },
-) error {
-	for _, podName := range targets {
-		pod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      podName,
-				Namespace: namespace,
-			},
-		}
-
-		// Use graceful deletion with a short grace period
-		gracePeriod := int64(0)
-		if err := e.client.Delete(ctx, pod, &client.DeleteOptions{
+	for _, pod := range targets {
+		p := pod // capture
+		if err := e.client.Delete(ctx, &p, &client.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
 		}); err != nil {
-			return fmt.Errorf("failed to kill pod %s: %w", podName, err)
+			return fmt.Errorf("kill pod %s: %w", pod.Name, err)
 		}
-
-		logger.Info("Pod killed", "pod", podName, "namespace", namespace)
-		// Small delay between kills to avoid thundering herd
+		logger.Info("pod killed", "pod", pod.Name, "namespace", pod.Namespace)
 		time.Sleep(500 * time.Millisecond)
 	}
 	return nil
 }
 
-func (e *Executor) startCPUStress(
-	ctx context.Context,
-	exp *chaosv1alpha1.ChaosExperiment,
-	targets []string,
-) error {
-	params := exp.Spec.Fault.CPUStress
+func (e *Executor) startCPUStress(ctx context.Context, targets []corev1.Pod, params *chaosv1alpha1.CPUStressParams) error {
 	if params == nil {
-		return fmt.Errorf("CPUStress params required for CPUStress fault")
+		params = &chaosv1alpha1.CPUStressParams{Cores: 1, Load: 80}
 	}
 
-	// Inject a stress sidecar pod for each target
-	for _, target := range targets {
+	for _, pod := range targets {
 		stressPod := buildStressPod(
-			exp.Namespace,
-			fmt.Sprintf("chaos-cpu-%s", target),
+			pod.Namespace,
+			fmt.Sprintf("chaos-cpu-%s", pod.Name[:min(8, len(pod.Name))]),
 			[]string{
 				"stress-ng",
 				"--cpu", fmt.Sprintf("%d", params.Cores),
 				"--cpu-load", fmt.Sprintf("%d", params.Load),
-				"--timeout", exp.Spec.Duration,
 			},
 			map[string]string{
-				"chaos.sharatvikas.io/experiment": exp.Name,
-				"chaos.sharatvikas.io/target-pod": target,
+				"chaos.sharatvikas.io/managed":    "true",
+				"chaos.sharatvikas.io/fault-type": "cpu-stress",
+				"chaos.sharatvikas.io/target-pod": pod.Name,
 			},
 		)
-
+		stressPod.Spec.NodeName = pod.Spec.NodeName
 		if err := e.client.Create(ctx, stressPod); err != nil {
-			return fmt.Errorf("failed to create CPU stress pod for %s: %w", target, err)
+			return fmt.Errorf("create CPU stress pod for %s: %w", pod.Name, err)
 		}
 	}
 	return nil
 }
 
-func (e *Executor) startMemoryStress(
-	ctx context.Context,
-	exp *chaosv1alpha1.ChaosExperiment,
-	targets []string,
-) error {
-	params := exp.Spec.Fault.MemoryStress
+func (e *Executor) startMemoryStress(ctx context.Context, targets []corev1.Pod, params *chaosv1alpha1.MemoryStressParams) error {
 	if params == nil {
-		return fmt.Errorf("MemoryStress params required for MemoryStress fault")
+		params = &chaosv1alpha1.MemoryStressParams{FillPercentage: 80}
 	}
 
 	vmBytes := fmt.Sprintf("%dM", params.MemoryMB)
-	for _, target := range targets {
+	if params.FillPercentage > 0 {
+		vmBytes = fmt.Sprintf("%d%%", params.FillPercentage)
+	}
+
+	for _, pod := range targets {
 		stressPod := buildStressPod(
-			exp.Namespace,
-			fmt.Sprintf("chaos-mem-%s", target),
-			[]string{
-				"stress-ng",
-				"--vm", "1",
-				"--vm-bytes", vmBytes,
-				"--timeout", exp.Spec.Duration,
-			},
+			pod.Namespace,
+			fmt.Sprintf("chaos-mem-%s", pod.Name[:min(8, len(pod.Name))]),
+			[]string{"stress-ng", "--vm", "1", "--vm-bytes", vmBytes},
 			map[string]string{
-				"chaos.sharatvikas.io/experiment": exp.Name,
-				"chaos.sharatvikas.io/target-pod": target,
+				"chaos.sharatvikas.io/managed":    "true",
+				"chaos.sharatvikas.io/fault-type": "memory-stress",
+				"chaos.sharatvikas.io/target-pod": pod.Name,
 			},
 		)
-
+		stressPod.Spec.NodeName = pod.Spec.NodeName
 		if err := e.client.Create(ctx, stressPod); err != nil {
-			return fmt.Errorf("failed to create memory stress pod for %s: %w", target, err)
+			return fmt.Errorf("create memory stress pod for %s: %w", pod.Name, err)
 		}
 	}
 	return nil
 }
 
+func (e *Executor) stopStressPods(ctx context.Context, namespace string) error {
+	var podList corev1.PodList
+	if err := e.client.List(ctx, &podList,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"chaos.sharatvikas.io/managed": "true"},
+	); err != nil {
+		return err
+	}
+
+	gracePeriod := int64(0)
+	for _, pod := range podList.Items {
+		p := pod
+		if err := e.client.Delete(ctx, &p, &client.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		}); err != nil {
+			return fmt.Errorf("delete stress pod %s: %w", pod.Name, err)
+		}
+	}
+	return nil
+}
+
+// buildStressPod creates a stress-ng Pod spec.
 func buildStressPod(namespace, name string, args []string, labels map[string]string) *corev1.Pod {
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -223,21 +124,20 @@ func buildStressPod(namespace, name string, args []string, labels map[string]str
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
+			Tolerations:   []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
 			Containers: []corev1.Container{
 				{
-					Name:    "stress",
-					Image:   "alexeiled/stress-ng:latest",
-					Args:    args,
+					Name:  "stress",
+					Image: "alexeiled/stress-ng:latest",
+					Args:  args,
 					Resources: corev1.ResourceRequirements{
 						Limits: corev1.ResourceList{
-							corev1.ResourceCPU:    resource("2"),
-							corev1.ResourceMemory: resource("2Gi"),
+							corev1.ResourceCPU:    resource.MustParse("2"),
+							corev1.ResourceMemory: resource.MustParse("2Gi"),
 						},
-					},
-					SecurityContext: &corev1.SecurityContext{
-						RunAsNonRoot: boolPtr(false), // stress-ng needs root
-						Capabilities: &corev1.Capabilities{
-							Add: []corev1.Capability{"SYS_RESOURCE"},
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("100m"),
+							corev1.ResourceMemory: resource.MustParse("64Mi"),
 						},
 					},
 				},
@@ -246,18 +146,35 @@ func buildStressPod(namespace, name string, args []string, labels map[string]str
 	}
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
+// selectPods applies mode-based pod selection (used by SelectTargets in executor.go).
+func selectPodsFromList(pods []corev1.Pod, count int, mode string) []corev1.Pod {
+	switch mode {
+	case "all", "All":
+		return pods
+	case "fixed", "Fixed":
+		sorted := make([]corev1.Pod, len(pods))
+		copy(sorted, pods)
+		sort.Slice(sorted, func(i, j int) bool {
+			return sorted[i].Name < sorted[j].Name
+		})
+		if count > len(sorted) {
+			return sorted
+		}
+		return sorted[:count]
+	default:
+		shuffled := make([]corev1.Pod, len(pods))
+		copy(shuffled, pods)
+		rand.Shuffle(len(shuffled), func(i, j int) {
+			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+		})
+		if count > len(shuffled) {
+			return shuffled
+		}
+		return shuffled[:count]
 	}
-	return b
 }
 
 func boolPtr(b bool) *bool { return &b }
 
-func resource(s string) resource_quantity {
-	// Stub — in real code use resource.MustParse
-	return resource_quantity{}
-}
-
-type resource_quantity = struct{}
+// Keep unused import warnings away
+var _ = boolPtr

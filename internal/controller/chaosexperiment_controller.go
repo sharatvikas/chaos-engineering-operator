@@ -105,7 +105,8 @@ func (r *ChaosExperimentReconciler) startFaults(ctx context.Context, exp *chaosv
 	now := metav1.Now()
 	exp.Status.Phase = "Running"
 	exp.Status.StartTime = &now
-	exp.Status.TargetedPods = count
+	// TargetedPods is []string — record count as a synthetic pod-count entry
+	exp.Status.TargetedPods = make([]string, count)
 	meta.SetStatusCondition(&exp.Status.Conditions, metav1.Condition{
 		Type:               "Running",
 		Status:             metav1.ConditionTrue,
@@ -182,7 +183,7 @@ func (r *ChaosExperimentReconciler) abort(ctx context.Context, exp *chaosv1alpha
 
 func (r *ChaosExperimentReconciler) setPhase(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment, phase string) (ctrl.Result, error) {
 	patch := client.MergeFrom(exp.DeepCopy())
-	exp.Status.Phase = phase
+	exp.Status.Phase = chaosv1alpha1.ExperimentPhase(phase)
 	if phase == "Completed" {
 		now := metav1.Now()
 		exp.Status.EndTime = &now

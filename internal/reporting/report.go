@@ -81,24 +81,27 @@ func New(c client.Client) *Reporter {
 
 // BuildReport assembles a report from a completed ChaosExperiment.
 func BuildReport(exp *chaosv1alpha1.ChaosExperiment, gates []GateSnapshot, slo SLOSnapshot) *ExperimentReport {
-	startedAt := exp.Status.StartedAt.Time
+	var startedAt time.Time
+	if exp.Status.StartTime != nil {
+		startedAt = exp.Status.StartTime.Time
+	}
 	completedAt := time.Now()
-	if !exp.Status.CompletedAt.IsZero() {
-		completedAt = exp.Status.CompletedAt.Time
+	if exp.Status.EndTime != nil && !exp.Status.EndTime.IsZero() {
+		completedAt = exp.Status.EndTime.Time
 	}
 
 	return &ExperimentReport{
 		ExperimentName: exp.Name,
 		Namespace:      exp.Namespace,
-		FaultType:      string(exp.Spec.FaultType),
+		FaultType:      string(exp.Spec.Fault.Type),
 		StartedAt:      startedAt,
 		CompletedAt:    completedAt,
 		DurationSec:    completedAt.Sub(startedAt).Seconds(),
 		Outcome:        string(exp.Status.Phase),
 		AbortReason:    exp.Status.AbortReason,
-		TargetCount:    len(exp.Status.TargetPods),
-		TargetNames:    exp.Status.TargetPods,
-		BlastRadiusPct: exp.Spec.BlastRadius.Percentage,
+		TargetCount:    len(exp.Status.TargetedPods),
+		TargetNames:    exp.Status.TargetedPods,
+		BlastRadiusPct: exp.Spec.Target.Percentage,
 		SafetyGates:    gates,
 		SLOImpact:      slo,
 	}

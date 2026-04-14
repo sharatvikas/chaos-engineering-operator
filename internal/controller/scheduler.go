@@ -132,8 +132,9 @@ func HandleScheduledRun(
 	nowMeta := metav1.NewTime(now)
 	updated.Status.LastScheduledTime = &nowMeta
 	updated.Status.Phase = chaosv1alpha1.PhasePending
-	updated.Status.Message = fmt.Sprintf(
-		"Scheduled run triggered at %s", now.Format(time.RFC3339),
+	// Message is not a field on ChaosExperimentStatus; log it instead
+	logger.Info("scheduled run triggered message",
+		"message", fmt.Sprintf("Scheduled run triggered at %s", now.Format(time.RFC3339)),
 	)
 
 	logger.Info("scheduled run triggered",

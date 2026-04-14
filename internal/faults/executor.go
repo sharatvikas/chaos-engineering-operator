@@ -31,20 +31,20 @@ func (e *Executor) Start(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment
 	}
 	if len(targets) == 0 {
 		return 0, fmt.Errorf("no pods matched label selector %v in namespace %s",
-			exp.Spec.Target.LabelSelector, exp.Spec.Target.Namespace)
+			exp.Spec.Target.Selector.MatchLabels, exp.Spec.Target.Namespace)
 	}
 
 	switch exp.Spec.Fault.Type {
 	case "PodKill":
-		return len(targets), e.startPodKill(ctx, targets, exp.Spec.Fault.PodKill)
+		return len(targets), e.startPodKill(ctx, targets, nil)
 	case "CPUStress":
 		return len(targets), e.startCPUStress(ctx, targets, exp.Spec.Fault.CPUStress)
 	case "MemoryStress":
 		return len(targets), e.startMemoryStress(ctx, targets, exp.Spec.Fault.MemoryStress)
 	case "NetworkDelay":
 		return len(targets), e.startNetworkDelay(ctx, targets, exp.Spec.Fault.NetworkDelay)
-	case "NetworkLoss":
-		return len(targets), e.startNetworkLoss(ctx, targets, exp.Spec.Fault.NetworkLoss)
+	case "DNSFailure":
+		return len(targets), e.startDNSFailure(ctx, targets)
 	default:
 		return 0, fmt.Errorf("unknown fault type: %s", exp.Spec.Fault.Type)
 	}
@@ -58,7 +58,8 @@ func (e *Executor) Stop(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment)
 	}
 
 	switch exp.Spec.Fault.Type {
-	case "NetworkDelay", "NetworkLoss":
+	case "NetworkDelay", "NetworkLoss", "DNSFailure":
+		// All network-family faults use managed sidecar pods — clean them up
 		return e.stopNetworkFaults(ctx, ns)
 	case "CPUStress", "MemoryStress":
 		return e.stopStressPods(ctx, ns)
@@ -80,7 +81,7 @@ func (e *Executor) SelectTargets(ctx context.Context, exp *chaosv1alpha1.ChaosEx
 	var podList corev1.PodList
 	if err := e.client.List(ctx, &podList,
 		client.InNamespace(ns),
-		client.MatchingLabels(exp.Spec.Target.LabelSelector),
+		client.MatchingLabels(exp.Spec.Target.Selector.MatchLabels),
 	); err != nil {
 		return nil, fmt.Errorf("list pods: %w", err)
 	}
@@ -101,7 +102,7 @@ func (e *Executor) SelectTargets(ctx context.Context, exp *chaosv1alpha1.ChaosEx
 }
 
 // applySelectionStrategy applies percentage + mode to candidate pods.
-func (e *Executor) applySelectionStrategy(pods []corev1.Pod, target chaosv1alpha1.ExperimentTarget) []corev1.Pod {
+func (e *Executor) applySelectionStrategy(pods []corev1.Pod, target chaosv1alpha1.TargetSpec) []corev1.Pod {
 	pct := target.Percentage
 	if pct <= 0 {
 		pct = 25
