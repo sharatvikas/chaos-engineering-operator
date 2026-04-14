@@ -3,7 +3,6 @@ package faults
 import (
 	"context"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -21,33 +20,15 @@ import (
 func (e *Executor) startNetworkDelay(ctx context.Context, targets []corev1.Pod, params *chaosv1alpha1.NetworkDelayParams) error {
 	if params == nil {
 		params = &chaosv1alpha1.NetworkDelayParams{
-			LatencyMs:  200,
-			JitterMs:   20,
-			Correlation: 25,
+			LatencyMs:      200,
+			JitterMs:       20,
+			CorrelationPct: 25,
 		}
 	}
 
 	for _, pod := range targets {
-		if err := e.injectNetworkFault(ctx, pod, "delay", params, nil); err != nil {
+		if err := e.injectNetworkFault(ctx, pod, "delay", params); err != nil {
 			return fmt.Errorf("inject network delay on %s: %w", pod.Name, err)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return nil
-}
-
-// startNetworkLoss injects packet loss using a tc-netem sidecar.
-func (e *Executor) startNetworkLoss(ctx context.Context, targets []corev1.Pod, params *chaosv1alpha1.NetworkLossParams) error {
-	if params == nil {
-		params = &chaosv1alpha1.NetworkLossParams{
-			LossPercent: 10,
-			Correlation: 25,
-		}
-	}
-
-	for _, pod := range targets {
-		if err := e.injectNetworkFault(ctx, pod, "loss", nil, params); err != nil {
-			return fmt.Errorf("inject network loss on %s: %w", pod.Name, err)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -69,17 +50,15 @@ func (e *Executor) startNetworkLoss(ctx context.Context, targets []corev1.Pod, p
 func (e *Executor) injectNetworkFault(
 	ctx context.Context,
 	target corev1.Pod,
-	faultType string, // "delay" or "loss"
+	faultType string, // "delay"
 	delayParams *chaosv1alpha1.NetworkDelayParams,
-	lossParams *chaosv1alpha1.NetworkLossParams,
 ) error {
-	tcCommand := buildTCCommand(target.Status.PodIP, faultType, delayParams, lossParams)
+	tcCommand := buildTCCommand(target.Status.PodIP, delayParams)
 	cleanupCommand := fmt.Sprintf(
 		"tc qdisc del dev eth0 root 2>/dev/null; tc filter del dev eth0 2>/dev/null || true",
 	)
 
-	// Duration to hold the fault — read from experiment spec via context value
-	// For now default to experiment duration or 5m
+	// Duration to hold the fault — default to 5m
 	holdDuration := "300" // seconds
 
 	sidecarName := fmt.Sprintf("chaos-net-%s-%s", faultType, target.Name[:min(8, len(target.Name))])
@@ -97,9 +76,9 @@ func (e *Executor) injectNetworkFault(
 			},
 		},
 		Spec: corev1.PodSpec{
-			NodeName:    target.Spec.NodeName,
-			HostPID:     hostPID,
-			HostNetwork: true,
+			NodeName:      target.Spec.NodeName,
+			HostPID:       hostPID,
+			HostNetwork:   true,
 			RestartPolicy: corev1.RestartPolicyNever,
 			// Tolerate all taints to reach the target node
 			Tolerations: []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
@@ -156,33 +135,19 @@ func (e *Executor) injectNetworkFault(
 	return e.client.Create(ctx, pod)
 }
 
-// buildTCCommand builds the `tc` command string for the given fault type.
+// buildTCCommand builds the `tc` netem delay command string.
 // Uses netem qdisc for realistic network impairment simulation.
-func buildTCCommand(podIP, faultType string, delay *chaosv1alpha1.NetworkDelayParams, loss *chaosv1alpha1.NetworkLossParams) string {
-	var netemArgs string
-
-	switch faultType {
-	case "delay":
-		latency := 200
-		jitter := 20
-		correlation := 25
-		if delay != nil {
-			latency = delay.LatencyMs
-			jitter = delay.JitterMs
-			correlation = delay.Correlation
-		}
-		// distribution normal gives more realistic latency distribution than uniform
-		netemArgs = fmt.Sprintf("delay %dms %dms %d%% distribution normal", latency, jitter, correlation)
-
-	case "loss":
-		pct := 10
-		corr := 25
-		if loss != nil {
-			pct = loss.LossPercent
-			corr = loss.Correlation
-		}
-		netemArgs = fmt.Sprintf("loss %d%% %d%%", pct, corr)
+func buildTCCommand(podIP string, delay *chaosv1alpha1.NetworkDelayParams) string {
+	latency := 200
+	jitter := 20
+	correlation := 25
+	if delay != nil {
+		latency = delay.LatencyMs
+		jitter = delay.JitterMs
+		correlation = delay.CorrelationPct
 	}
+	// distribution normal gives more realistic latency distribution than uniform
+	netemArgs := fmt.Sprintf("delay %dms %dms %d%% distribution normal", latency, jitter, correlation)
 
 	// Apply netem only to traffic FROM the target pod IP using u32 filter:
 	// 1. Add prio qdisc as root (allows multiple filters)
@@ -222,6 +187,3 @@ func min(a, b int) int {
 	}
 	return b
 }
-
-// Keep strconv imported
-var _ = strconv.Itoa

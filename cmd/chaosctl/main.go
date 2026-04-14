@@ -81,25 +81,15 @@ func listCmd() *cobra.Command {
 			ctx := context.Background()
 			ns := resolveNamespace()
 
-			var list *metav1.List
-			if ns == "" {
-				result, err := dc.Resource(chaosExperimentGVR).Namespace("").List(ctx, metav1.ListOptions{})
-				if err != nil {
-					return fmt.Errorf("list experiments: %w", err)
-				}
-				list = &metav1.List{Items: result.Items}
-			} else {
-				result, err := dc.Resource(chaosExperimentGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
-				if err != nil {
-					return fmt.Errorf("list experiments: %w", err)
-				}
-				list = &metav1.List{Items: result.Items}
+			result, err := dc.Resource(chaosExperimentGVR).Namespace(ns).List(ctx, metav1.ListOptions{})
+			if err != nil {
+				return fmt.Errorf("list experiments: %w", err)
 			}
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 			fmt.Fprintln(w, "NAMESPACE\tNAME\tPHASE\tFAULT\tDURATION\tSCHEDULE\tLAST RUN\tAGE")
 
-			for _, item := range list.Items {
+			for _, item := range result.Items {
 				obj := item.Object
 
 				meta := getMap(obj, "metadata")
