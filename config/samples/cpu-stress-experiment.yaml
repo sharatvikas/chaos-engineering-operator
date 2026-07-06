@@ -1,21 +1,39 @@
+##
+## ChaosExperiment: CPU Stress — Auth Service
+##
+## Saturates CPU on one auth-service pod at a time to validate that the
+## service sheds load gracefully (rate limiting before 5xx) and the HPA
+## scales out before downstream services degrade.
+##
 apiVersion: chaos.sharatvikas.io/v1alpha1
 kind: ChaosExperiment
 metadata:
   name: auth-service-cpu-stress
   namespace: production
+  labels:
+    category: resource
+    service: auth-service
+    environment: production
+  annotations:
+    chaos.sharatvikas.io/owner: "platform-team"
+    chaos.sharatvikas.io/hypothesis: >
+      Under CPU saturation the auth-service HPA scales out within 3 minutes and
+      the api-gateway error rate stays below 3% throughout.
 spec:
   target:
-    labelSelector:
-      app: auth-service
+    selector:
+      matchLabels:
+        app: auth-service
     namespace: production
-    percentage: 25       # Stress 1 pod at a time
-    mode: random
+    percentage: 25            # Stress ~1 pod at a time
+    mode: Random
+    minHealthyReplicas: 3     # Keep at least 3 healthy replicas serving
 
   fault:
     type: CPUStress
     cpuStress:
-      workers: 2         # Number of stress-ng CPU workers
-      load: 80           # 80% CPU load per worker
+      cores: 2                # Number of stress-ng CPU workers
+      load: 80                # 80% CPU load per core
 
   duration: 15m
   cooldown: 15m
@@ -23,18 +41,22 @@ spec:
   safetyGates:
     - type: SLOBurnRate
       service: auth-service
-      threshold: "6x"    # Slow burn threshold
+      threshold: "6x"         # Slow-burn threshold
 
     - type: ErrorRate
       service: auth-service
       threshold: "1"
 
-    # Custom Prometheus query gate — block if downstream services are already degraded
-    - type: Custom
+    # Block if downstream api-gateway is already degraded (custom PromQL gate)
+    - type: ErrorRate
       prometheusQuery: |
         sum(rate(http_requests_total{status=~"5..",job="api-gateway"}[5m]))
         /
         sum(rate(http_requests_total{job="api-gateway"}[5m])) * 100
       threshold: "3"
+
+  notifications:
+    slack: "#chaos-experiments"
+    pagerduty: false
 
   dryRun: false

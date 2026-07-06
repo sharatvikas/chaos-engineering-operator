@@ -1,0 +1,65 @@
+##
+## ChaosExperiment: Container Kill — Checkout Service
+##
+## Kills the "server" container inside checkout-service pods (without deleting
+## the pod) by signalling PID 1. The kubelet restarts just that container,
+## exercising:
+##   1. Container restart + readiness re-gating (traffic pauses until ready)
+##   2. Warm-cache / in-memory state loss and cold-start latency
+##   3. Sidecars (envoy, otel-agent) surviving the restart of the app container
+##
+## Container kill is finer-grained than PodKill: the pod's IP, PVCs, and
+## sidecars persist, so it isolates application-process failure specifically.
+##
+## To run:
+##   kubectl apply -f container-kill-experiment.yaml
+##   kubectl get chaos checkout-container-kill -n staging -w
+##
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: checkout-container-kill
+  namespace: staging
+  labels:
+    category: pod
+    service: checkout-service
+    environment: staging
+  annotations:
+    chaos.sharatvikas.io/owner: "checkout-team"
+    chaos.sharatvikas.io/hypothesis: >
+      When the checkout-service application container is SIGKILLed, the kubelet
+      restarts it within 10s, readiness gating drains it from the Service
+      until warm, and no in-flight orders are lost (idempotent write path).
+spec:
+  target:
+    selector:
+      matchLabels:
+        app: checkout-service
+    namespace: staging
+    percentage: 25            # One container at a time
+    mode: Random
+    minHealthyReplicas: 2
+
+  fault:
+    type: ContainerKill
+    containerKill:
+      containerName: server   # Kill the app container, not the envoy sidecar
+      signal: SIGKILL         # Hard kill; use SIGTERM to test graceful shutdown
+
+  duration: 5m
+  cooldown: 5m
+
+  safetyGates:
+    - type: Availability
+      service: checkout-service
+      threshold: "99.0"
+
+    - type: ErrorRate
+      service: checkout-service
+      threshold: "2"
+
+  notifications:
+    slack: "#chaos-experiments"
+    pagerduty: false
+
+  dryRun: false

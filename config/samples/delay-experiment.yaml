@@ -1,23 +1,40 @@
+##
+## ChaosExperiment: Network Delay — Payment Service
+##
+## Injects 300ms±50ms egress latency on one in three payment-service API pods
+## via tc/netem, verifying timeout/retry budgets and SLO burn stay in bounds.
+##
 apiVersion: chaos.sharatvikas.io/v1alpha1
 kind: ChaosExperiment
 metadata:
   name: payment-service-network-delay
   namespace: production
+  labels:
+    category: network
+    service: payment-service
+    environment: production
+  annotations:
+    chaos.sharatvikas.io/owner: "payments-team"
+    chaos.sharatvikas.io/hypothesis: >
+      With 300ms added latency on a third of payment-service pods, client
+      timeouts and retries absorb the delay and the error rate stays under 2%.
 spec:
   target:
-    labelSelector:
-      app: payment-service
-      tier: api
+    selector:
+      matchLabels:
+        app: payment-service
+        tier: api
     namespace: production
-    percentage: 33       # Affect 1 in 3 pods
-    mode: random
+    percentage: 33            # Affect 1 in 3 pods
+    mode: Random
+    minHealthyReplicas: 2
 
   fault:
     type: NetworkDelay
     networkDelay:
-      latencyMs: 300     # 300ms added latency
-      jitterMs: 50       # ±50ms jitter
-      correlation: 25    # 25% correlation between successive packets
+      latencyMs: 300          # 300ms added latency
+      jitterMs: 50            # ±50ms jitter
+      correlationPct: 25      # 25% correlation between successive packets
 
   duration: 10m
   cooldown: 10m
@@ -25,10 +42,14 @@ spec:
   safetyGates:
     - type: SLOBurnRate
       service: payment-service
-      threshold: "3x"    # Abort if burn rate exceeds 3x (before page threshold)
+      threshold: "3x"         # Abort if burn rate exceeds 3x (before page threshold)
 
     - type: ErrorRate
       service: payment-service
-      threshold: "2"     # Abort if error rate exceeds 2%
+      threshold: "2"          # Abort if error rate exceeds 2%
 
-  dryRun: false          # Set to true to validate targeting without injecting
+  notifications:
+    slack: "#chaos-experiments"
+    pagerduty: false
+
+  dryRun: false               # Set to true to validate targeting without injecting

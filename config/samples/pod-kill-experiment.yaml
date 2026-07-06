@@ -1,20 +1,43 @@
+##
+## ChaosExperiment: Pod Kill — Recommendation Service
+##
+## Kills half the recommendation-service pods to verify the Deployment
+## reschedules replacements and the autoscaler reacts, while a min-healthy
+## guard guarantees the experiment never drops the service below 2 replicas.
+##
+## To run:
+##   kubectl apply -f pod-kill-experiment.yaml
+##   kubectl get chaos recommendation-service-pod-kill -n staging -w
+##
 apiVersion: chaos.sharatvikas.io/v1alpha1
 kind: ChaosExperiment
 metadata:
   name: recommendation-service-pod-kill
   namespace: staging
+  labels:
+    category: pod
+    service: recommendation-service
+    environment: staging
+  annotations:
+    chaos.sharatvikas.io/owner: "sre-team"
+    chaos.sharatvikas.io/hypothesis: >
+      When 50% of recommendation-service pods are killed, the Deployment
+      reschedules them within 30s and availability stays above 99% because
+      surviving replicas absorb traffic.
 spec:
   target:
-    labelSelector:
-      app: recommendation-service
+    selector:
+      matchLabels:
+        app: recommendation-service
     namespace: staging
-    percentage: 50       # Kill half the pods to test autoscaler response
-    mode: random
+    percentage: 50            # Kill half the pods to test autoscaler response
+    mode: Random
+    minHealthyReplicas: 2     # Preflight guard: never leave fewer than 2 running
 
   fault:
     type: PodKill
     podKill:
-      gracePeriodSeconds: 0   # Hard kill — simulates node failure
+      gracePeriodSeconds: 0   # Hard kill — simulates node/process failure
 
   duration: 5m
   cooldown: 5m
@@ -22,6 +45,10 @@ spec:
   safetyGates:
     - type: Availability
       service: recommendation-service
-      threshold: "99.0"  # Abort if availability drops below 99%
+      threshold: "99.0"       # Abort if availability drops below 99%
+
+  notifications:
+    slack: "#chaos-experiments"
+    pagerduty: false
 
   dryRun: false

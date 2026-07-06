@@ -37,10 +37,14 @@ spec:
       matchLabels:
         app: payments-api
     namespace: production
-    percentage: 30           # Kill 30% of pods
+    percentage: 30            # Affect 30% of matching pods
+    mode: Random              # Random | All | Fixed
+    minHealthyReplicas: 2     # Preflight guard: never leave < 2 running
 
   fault:
-    type: PodKill            # PodKill | NetworkDelay | CPUStress | MemoryStress | DNSFailure
+    type: PodKill             # See the Fault Catalog below for all types
+    podKill:
+      gracePeriodSeconds: 0   # Hard kill
 
   duration: 10m
   cooldown: 5m
@@ -48,10 +52,10 @@ spec:
   safetyGates:
     - type: SLOBurnRate
       service: payments-api
-      threshold: 5x           # Abort if burn rate > 5x normal
+      threshold: "5x"         # Abort if burn rate > 5x normal
     - type: ErrorRate
-      endpoint: /health
-      threshold: 10           # Abort if error rate > 10%
+      service: payments-api
+      threshold: "10"         # Abort if error rate > 10%
 
   schedule:
     cron: "0 14 * * 2"        # Every Tuesday at 2pm
@@ -62,75 +66,81 @@ spec:
     pagerduty: false          # Don't page on-call during planned chaos
 ```
 
-### ChaosSuite
-
-```yaml
-apiVersion: chaos.sharatvikas.io/v1alpha1
-kind: ChaosSuite
-metadata:
-  name: gameday-q2-2026
-spec:
-  experiments:
-    - name: kill-payment-pods
-    - name: slow-database-network
-    - name: stress-search-cpu
-  mode: Sequential            # Sequential | Parallel
-  report:
-    enabled: true
-    destination: s3://my-chaos-reports/
-```
+Runnable, fully-annotated manifests for every fault type live in
+[`config/samples/`](config/samples). A step-by-step walkthrough is in
+[`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md).
 
 ---
 
-## Supported Fault Types
+## Fault Catalog
 
-| Fault | What it does | Platform |
-|-------|-------------|----------|
-| `PodKill` | Terminates pods matching selector | Any |
-| `NetworkDelay` | Injects latency via tc/netem | Linux |
-| `NetworkPartition` | Drops traffic between services via iptables | Linux |
-| `CPUStress` | Burns CPU cycles in container | Any |
-| `MemoryStress` | Allocates memory to trigger OOM conditions | Any |
-| `DNSFailure` | Makes DNS resolution fail for target pods | Any |
-| `DiskFill` | Fills ephemeral storage | Linux |
-| `NodeDrain` | Cordons and drains a node (with undo) | Any |
+Every fault implements a single `Injector` interface (`Inject` / `Rollback` /
+`Describe`) and is wired into the controller through a registry, so the fault
+set is fully data-driven.
+
+| Fault | Params key | Injection mechanism | Rollback |
+|-------|------------|---------------------|----------|
+| `PodKill` | `podKill` | Deletes pods with a configurable grace period | None (workload controller reschedules) |
+| `ContainerKill` | `containerKill` | Exec's `kill -<signal> 1` into a named container (SPDY stream to kubelet) | None (kubelet restarts container) |
+| `NetworkDelay` | `networkDelay` | Privileged node sidecar applies `tc`/`netem` latency + jitter to the pod's egress | Deletes sidecar; `tc qdisc del` on preStop |
+| `NetworkPartition` | `networkPartition` | Privileged node sidecar `iptables -j DROP` on FORWARD (egress/ingress, optional peer CIDRs) | Deletes sidecar; `iptables -D` on preStop |
+| `CPUStress` | `cpuStress` | `stress-ng` pod co-scheduled on the target's node | Deletes stress pod |
+| `MemoryStress` | `memoryStress` | `stress-ng --vm` pod co-scheduled on the target's node | Deletes stress pod |
+| `DNSFailure` | — | Privileged node sidecar drops port-53 (UDP+TCP) from the pod IP | Deletes sidecar; `iptables -D` on preStop |
+
+`DiskFill` and `NodeDrain` are reserved in the API enum but not yet
+implemented; the registry returns a clear error if they are requested.
+
+Every artifact the operator creates is labelled with
+`chaos.sharatvikas.io/experiment=<name>`, so rollback deletes **only** the pods
+that experiment created — concurrent experiments never disturb each other.
 
 ---
 
 ## Safety Architecture
 
+Safety is layered: cheap static guards run first (they never call out to
+Prometheus, so they never "fail open"), then live SLO gates gate both the
+start and the entire duration of the experiment.
+
 ```
-Experiment Starts
+Experiment Starts (Pending → PreflightCheck)
        │
        ▼
-┌──────────────────┐
-│  Pre-flight Check│  ← Verify SLOs are healthy before starting
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ Blast Radius Calc│  ← Never exceed configured % of replicas
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Fault Injection │
-│  (progressive)   │  ← 1 pod → N% → target%
-└────────┬─────────┘
-         │
-         ├── SLO Gate polling every 10s
-         │      └── Burn rate > threshold? → ABORT + ROLLBACK
-         │
-         ▼
-┌──────────────────┐
-│  Auto Rollback   │  ← Restores all modified resources
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│  Experiment Report│ ← Markdown report + metrics timeline
-└──────────────────┘
+┌───────────────────────────┐
+│ Static preflight guards    │
+│  • namespace denylist      │  ← kube-system, chaos-system, … are protected
+│  • min-healthy-replicas    │  ← block if fault would drop below N healthy
+└────────────┬──────────────┘
+             │ pass
+             ▼
+┌───────────────────────────┐
+│ Prometheus SLO gates       │  ← SLOBurnRate / ErrorRate / Availability
+│  (blocks start if breached)│     + arbitrary PromQL gates
+└────────────┬──────────────┘
+             │ pass
+             ▼
+┌───────────────────────────┐
+│ Fault injection (Running)  │  ← target selection: label selector × %  × mode
+└────────────┬──────────────┘
+             │
+             ├── SLO gates re-polled every requeue while Running
+             │      └── breached? → HALT + AUTO-ROLLBACK → Aborted
+             │
+             ▼
+┌───────────────────────────┐
+│ Duration elapsed → Rollback│  ← Injector.Rollback removes all artifacts
+└────────────┬──────────────┘
+             │
+             ▼
+      Cooldown → Completed
 ```
+
+- **Fail-safe on selection errors:** if preflight target selection errors while
+  a `minHealthyReplicas` guard is set, the experiment is **blocked**, not run.
+- **Fail-open on Prometheus errors:** if a Prometheus query itself errors
+  (endpoint down), the SLO gate logs and continues rather than blocking all
+  chaos on a monitoring outage — a deliberate, documented trade-off.
 
 ---
 
@@ -149,17 +159,27 @@ helm install chaos-operator chaos-operator/chaos-engineering-operator \
 ### Run Your First Experiment
 
 ```bash
-# Apply a simple pod kill experiment (dry-run first)
-kubectl apply -f examples/pod-kill-basic.yaml --dry-run=server
+# Install the CRD
+kubectl apply -f config/crd/chaosexperiment.yaml
 
-# Run it for real
-kubectl apply -f examples/pod-kill-basic.yaml
+# Validate targeting + safety gates without injecting (set spec.dryRun: true),
+# then apply a fully-annotated sample experiment
+kubectl apply -f config/samples/pod-kill-experiment.yaml
 
-# Watch it in real time
-kubectl get chaosexperiment kill-payment-pods -n production -w
+# Watch it move through its phases
+kubectl get chaos recommendation-service-pod-kill -n staging -w
 
-# Get the report
-kubectl describe chaosexperiment kill-payment-pods -n production
+# Inspect the outcome (phase, targeted pods, abort reason, conditions)
+kubectl describe chaos recommendation-service-pod-kill -n staging
+```
+
+Samples are provided for every fault type:
+
+```bash
+ls config/samples/
+# container-kill-experiment.yaml   memory-stress-scheduled.yaml
+# cpu-stress-experiment.yaml       network-partition-experiment.yaml
+# delay-experiment.yaml            pod-kill-experiment.yaml
 ```
 
 ---
@@ -170,31 +190,33 @@ kubectl describe chaosexperiment kill-payment-pods -n production
 chaos-engineering-operator/
 ├── api/
 │   └── v1alpha1/
-│       ├── chaosexperiment_types.go
-│       └── chaossuite_types.go
+│       ├── chaosexperiment_types.go   # CRD types + fault params
+│       └── zz_generated_deepcopy.go
+├── cmd/
+│   ├── operator/main.go               # controller-manager entrypoint
+│   └── chaosctl/main.go               # CLI
 ├── internal/
 │   ├── controller/
-│   │   ├── chaosexperiment_controller.go
-│   │   └── chaossuite_controller.go
+│   │   ├── chaosexperiment_controller.go  # phase state machine
+│   │   ├── dryrun.go                       # dry-run simulation
+│   │   └── scheduler.go                    # cron scheduling
 │   ├── faults/
-│   │   ├── pod_kill.go
-│   │   ├── network_delay.go
-│   │   ├── cpu_stress.go
-│   │   └── memory_stress.go
+│   │   ├── injector.go        # Injector interface + Registry + rollback
+│   │   ├── executor.go        # target selection + dispatch
+│   │   ├── pod_kill.go        # PodKillInjector
+│   │   ├── container_kill.go  # ContainerKillInjector (exec)
+│   │   ├── network.go         # NetworkDelay + NetworkPartition injectors
+│   │   ├── stress.go          # CPU + Memory stress injectors
+│   │   └── dns.go             # DNSInjector
 │   ├── safety/
-│   │   ├── gates.go           # SLO burn rate, error rate gates
-│   │   └── rollback.go
-│   └── reporting/
-│       ├── markdown.go
-│       └── s3.go
+│   │   ├── gates.go           # Prometheus SLO gates
+│   │   └── preflight.go       # namespace denylist + min-healthy guards
+│   └── reporting/report.go    # structured reports (ConfigMap + Slack)
 ├── config/
-│   ├── crd/                   # Generated CRD manifests
-│   └── rbac/
-├── charts/                    # Helm chart
-├── examples/                  # Sample ChaosExperiment CRs
-└── docs/
-    ├── SAFETY.md
-    └── FAULT_TYPES.md
+│   ├── crd/                   # CRD manifest
+│   └── samples/               # one runnable ChaosExperiment per fault type
+├── helm/                      # Helm chart
+└── docs/WALKTHROUGH.md        # end-to-end example walkthrough
 ```
 
 ---
@@ -214,14 +236,15 @@ chaos-engineering-operator/
 
 ## Roadmap
 
-- [x] PodKill, CPUStress, MemoryStress
-- [x] SLO burn rate safety gate
-- [x] Progressive blast radius
-- [ ] NetworkDelay (tc/netem via init container)
-- [ ] NodeDrain fault
-- [ ] ChaosSuite controller
+- [x] PodKill, ContainerKill, CPUStress, MemoryStress
+- [x] NetworkDelay (tc/netem) + NetworkPartition (iptables) + DNSFailure
+- [x] SLO burn rate / error rate / availability safety gates
+- [x] Static preflight guards (namespace denylist, min-healthy-replicas)
+- [x] Halt + auto-rollback on mid-experiment SLO breach
+- [x] Dry-run simulation + cron scheduling
+- [ ] DiskFill and NodeDrain faults
+- [ ] ChaosSuite controller (GameDay orchestration)
 - [ ] Web UI dashboard
-- [ ] Argo Workflows integration
 - [ ] GameDay report PDF export
 
 ---

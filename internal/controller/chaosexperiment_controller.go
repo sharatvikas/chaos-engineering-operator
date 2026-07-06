@@ -9,6 +9,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -29,6 +31,35 @@ type ChaosExperimentReconciler struct {
 	client.Client
 	Scheme        *runtime.Scheme
 	PrometheusURL string
+
+	// RESTConfig and ClientSet enable exec-based faults (ContainerKill).
+	// They are optional: when nil (e.g. unit tests), exec faults return a
+	// clear error rather than crashing.
+	RESTConfig *rest.Config
+	ClientSet  kubernetes.Interface
+
+	// NamespaceDenylist lists namespaces experiments may never target.
+	// Empty means the built-in default set is used.
+	NamespaceDenylist []string
+}
+
+// newExecutor builds a fault Executor wired with this reconciler's runtime
+// dependencies (client + optional exec deps).
+func (r *ChaosExperimentReconciler) newExecutor() *faults.Executor {
+	return faults.NewExecutorWithDeps(faults.Deps{
+		Client:     r.Client,
+		RESTConfig: r.RESTConfig,
+		ClientSet:  r.ClientSet,
+	})
+}
+
+// preflight returns the configured static safety checker.
+func (r *ChaosExperimentReconciler) preflight() safety.PreflightChecker {
+	denylist := r.NamespaceDenylist
+	if len(denylist) == 0 {
+		denylist = safety.DefaultNamespaceDenylist()
+	}
+	return safety.PreflightChecker{NamespaceDenylist: denylist}
 }
 
 // +kubebuilder:rbac:groups=chaos.sharatvikas.io,resources=chaosexperiments,verbs=get;list;watch;create;update;patch;delete
@@ -69,6 +100,32 @@ func (r *ChaosExperimentReconciler) handlePending(ctx context.Context, exp *chao
 
 func (r *ChaosExperimentReconciler) handlePreflightCheck(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
+
+	// ── Static preflight guards (no external calls, never fail open) ───────
+	pf := r.preflight()
+
+	ns := exp.Spec.Target.Namespace
+	if ns == "" {
+		ns = exp.Namespace
+	}
+	if ok, reason := pf.CheckNamespace(ns); !ok {
+		logger.Info("preflight blocked experiment", "guard", "namespace-denylist", "reason", reason)
+		return r.abort(ctx, exp, fmt.Sprintf("preflight namespace guard: %s", reason))
+	}
+
+	if exp.Spec.Target.MinHealthyReplicas > 0 {
+		affected, total, err := r.newExecutor().SelectTargetsWithTotal(ctx, exp)
+		if err != nil {
+			logger.Error(err, "preflight target selection failed — failing safe (blocking)")
+			return r.abort(ctx, exp, fmt.Sprintf("preflight target selection failed: %v", err))
+		}
+		if ok, reason := pf.CheckMinHealthyReplicas(total, len(affected), exp.Spec.Target.MinHealthyReplicas); !ok {
+			logger.Info("preflight blocked experiment", "guard", "min-healthy-replicas", "reason", reason)
+			return r.abort(ctx, exp, fmt.Sprintf("preflight replica guard: %s", reason))
+		}
+	}
+
+	// ── Dynamic SLO gates (live Prometheus queries) ────────────────────────
 	checker := safety.NewGateChecker(r.PrometheusURL)
 
 	for _, gate := range exp.Spec.SafetyGates {
@@ -92,7 +149,7 @@ func (r *ChaosExperimentReconciler) handlePreflightCheck(ctx context.Context, ex
 
 func (r *ChaosExperimentReconciler) startFaults(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
-	executor := faults.NewExecutor(r.Client)
+	executor := r.newExecutor()
 
 	count, err := executor.Start(ctx, exp)
 	if err != nil {
@@ -130,8 +187,10 @@ func (r *ChaosExperimentReconciler) handleRunning(ctx context.Context, exp *chao
 			continue
 		}
 		if !safe {
-			logger.Info("mid-experiment gate tripped — aborting", "gate", gate.Type, "reason", reason)
-			_ = faults.NewExecutor(r.Client).Stop(ctx, exp)
+			logger.Info("mid-experiment gate tripped — auto-rolling back", "gate", gate.Type, "reason", reason)
+			if err := r.newExecutor().Stop(ctx, exp); err != nil {
+				logger.Error(err, "auto-rollback error — manual cleanup may be required")
+			}
 			return r.abort(ctx, exp, fmt.Sprintf("mid-experiment gate %s: %s", gate.Type, reason))
 		}
 	}
@@ -139,7 +198,7 @@ func (r *ChaosExperimentReconciler) handleRunning(ctx context.Context, exp *chao
 	duration, _ := parseDuration(exp.Spec.Duration)
 	if exp.Status.StartTime != nil && time.Since(exp.Status.StartTime.Time) >= duration {
 		logger.Info("duration elapsed — stopping faults")
-		if err := faults.NewExecutor(r.Client).Stop(ctx, exp); err != nil {
+		if err := r.newExecutor().Stop(ctx, exp); err != nil {
 			logger.Error(err, "fault cleanup error — manual cleanup may be required")
 		}
 		return r.setPhase(ctx, exp, "Cooldown")

@@ -1,5 +1,18 @@
 package faults
 
+// network.go — network-family faults implemented with privileged "chaos"
+// sidecar pods co-scheduled with each target on the same node.
+//
+//   - NetworkDelayInjector uses tc/netem to add latency + jitter to the
+//     target pod's egress, matched on the pod's source IP.
+//   - NetworkPartitionInjector uses iptables to DROP traffic to/from the
+//     target pod, either wholesale (full isolation) or restricted to a set
+//     of peer CIDRs (e.g. partition from the database subnet only).
+//
+// Running in the node's host network namespace (hostNetwork + NET_ADMIN)
+// works for any CNI/runtime without exec'ing into the target, and cleans up
+// via a preStop hook plus operator-driven Rollback.
+
 import (
 	"context"
 	"fmt"
@@ -7,113 +20,258 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	chaosv1alpha1 "github.com/sharatvikas/chaos-engineering-operator/api/v1alpha1"
 )
 
-// startNetworkDelay injects network latency using a tc-netem sidecar.
-// The sidecar runs in the host network namespace of each target pod's node,
-// targeting traffic from the pod's IP using `tc qdisc add`.
-func (e *Executor) startNetworkDelay(ctx context.Context, targets []corev1.Pod, params *chaosv1alpha1.NetworkDelayParams) error {
-	if params == nil {
-		params = &chaosv1alpha1.NetworkDelayParams{
-			LatencyMs:      200,
-			JitterMs:       20,
-			CorrelationPct: 25,
-		}
-	}
+const netToolsImage = "ghcr.io/sharatvikas/chaos-tc:latest"
 
-	for _, pod := range targets {
-		if err := e.injectNetworkFault(ctx, pod, "delay", params); err != nil {
-			return fmt.Errorf("inject network delay on %s: %w", pod.Name, err)
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	return nil
+// ─── NetworkDelay ───────────────────────────────────────────────────────────
+
+// NetworkDelayInjector implements Injector for the NetworkDelay fault.
+type NetworkDelayInjector struct {
+	deps Deps
 }
 
-// injectNetworkFault creates a privileged init+sidecar pod on the same node
-// that uses `tc` (traffic control) to manipulate the target pod's network egress.
-//
-// Architecture:
-//   - Sidecar pod runs as privileged with hostPID + hostNetwork
-//   - init container: resolves target pod IP and applies tc qdisc rule
-//   - main container: sleeps for experiment duration, then removes the rule
-//
-// Why tc/netem on the node rather than in-pod:
-//   - Works for any container runtime (no need to exec into pod)
-//   - Affects all traffic from that pod IP, including UDP and non-HTTP
-//   - Clean removal on pod deletion via preStop hook
-func (e *Executor) injectNetworkFault(
-	ctx context.Context,
-	target corev1.Pod,
-	faultType string, // "delay"
-	delayParams *chaosv1alpha1.NetworkDelayParams,
-) error {
-	tcCommand := buildTCCommand(target.Status.PodIP, delayParams)
-	cleanupCommand := fmt.Sprintf(
-		"tc qdisc del dev eth0 root 2>/dev/null; tc filter del dev eth0 2>/dev/null || true",
-	)
+func (i *NetworkDelayInjector) Type() chaosv1alpha1.FaultType {
+	return chaosv1alpha1.FaultNetworkDelay
+}
 
-	// Duration to hold the fault — default to 5m
-	holdDuration := "300" // seconds
+func (i *NetworkDelayInjector) Inject(ctx context.Context, req InjectRequest) (InjectResult, error) {
+	logger := log.FromContext(ctx)
+	params := req.Experiment.Spec.Fault.NetworkDelay
+	if params == nil {
+		params = &chaosv1alpha1.NetworkDelayParams{LatencyMs: 200, JitterMs: 20, CorrelationPct: 25}
+	}
 
-	sidecarName := fmt.Sprintf("chaos-net-%s-%s", faultType, target.Name[:min(8, len(target.Name))])
+	holdSec := durationSeconds(req.Experiment.Spec.Duration)
+	result := InjectResult{}
+	for idx := range req.Targets {
+		target := &req.Targets[idx]
+		if target.Status.PodIP == "" {
+			return result, fmt.Errorf("pod %s has no IP — not yet running", target.Name)
+		}
+		sidecar := buildNetemSidecar(req.Experiment, target, params, holdSec)
+		if err := i.deps.Client.Create(ctx, sidecar); err != nil {
+			return result, fmt.Errorf("inject network delay on %s: %w", target.Name, err)
+		}
+		result.AffectedPods = append(result.AffectedPods, target.Name)
+		result.Artifacts = append(result.Artifacts, sidecar.Name)
+		logger.Info("network delay injected", "target", target.Name, "latencyMs", params.LatencyMs)
+		time.Sleep(200 * time.Millisecond)
+	}
+	return result, nil
+}
 
+func (i *NetworkDelayInjector) Rollback(ctx context.Context, req RollbackRequest) error {
+	return rollbackManagedPods(ctx, i.deps.Client, req.Experiment)
+}
+
+func (i *NetworkDelayInjector) Describe(exp *chaosv1alpha1.ChaosExperiment) string {
+	p := exp.Spec.Fault.NetworkDelay
+	if p == nil {
+		return "Add default network latency (200ms±20ms) to targeted pods' egress."
+	}
+	return fmt.Sprintf("Add %dms±%dms latency to egress of %d%% of matching pods (tc/netem).",
+		p.LatencyMs, p.JitterMs, blastRadius(exp))
+}
+
+// buildNetemSidecar builds the privileged tc/netem sidecar for one target.
+func buildNetemSidecar(exp *chaosv1alpha1.ChaosExperiment, target *corev1.Pod, params *chaosv1alpha1.NetworkDelayParams, holdSec int) *corev1.Pod {
+	injectCmd := buildTCCommand(target.Status.PodIP, params)
+	cleanupCmd := "tc qdisc del dev eth0 root 2>/dev/null; tc filter del dev eth0 2>/dev/null || true"
+	name := fmt.Sprintf("chaos-net-delay-%s", shortName(target.Name))
+
+	return buildPrivilegedNodeSidecar(privilegedSidecarSpec{
+		exp:        exp,
+		target:     target,
+		name:       name,
+		faultType:  "network-delay",
+		injectCmd:  fmt.Sprintf("until ping -c1 -W1 %s >/dev/null 2>&1; do sleep 1; done && %s", target.Status.PodIP, injectCmd),
+		cleanupCmd: cleanupCmd,
+		holdSec:    holdSec,
+		caps:       []corev1.Capability{"NET_ADMIN", "SYS_ADMIN"},
+	})
+}
+
+// buildTCCommand builds the tc netem delay command targeting the pod's source IP.
+func buildTCCommand(podIP string, delay *chaosv1alpha1.NetworkDelayParams) string {
+	latency, jitter, correlation := 200, 20, 25
+	if delay != nil {
+		latency, jitter, correlation = delay.LatencyMs, delay.JitterMs, delay.CorrelationPct
+	}
+	netemArgs := fmt.Sprintf("delay %dms %dms %d%% distribution normal", latency, jitter, correlation)
+	return strings.Join([]string{
+		"tc qdisc add dev eth0 root handle 1: prio priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
+		fmt.Sprintf("tc qdisc add dev eth0 parent 1:1 handle 10: netem %s", netemArgs),
+		fmt.Sprintf("tc filter add dev eth0 parent 1:0 protocol ip u32 match ip src %s/32 flowid 1:1", podIP),
+	}, " && ")
+}
+
+// ─── NetworkPartition ───────────────────────────────────────────────────────
+
+// NetworkPartitionInjector implements Injector for the NetworkPartition fault.
+type NetworkPartitionInjector struct {
+	deps Deps
+}
+
+func (i *NetworkPartitionInjector) Type() chaosv1alpha1.FaultType {
+	return chaosv1alpha1.FaultNetworkPartition
+}
+
+func (i *NetworkPartitionInjector) Inject(ctx context.Context, req InjectRequest) (InjectResult, error) {
+	logger := log.FromContext(ctx)
+	params := req.Experiment.Spec.Fault.NetworkPartition
+	if params == nil {
+		params = &chaosv1alpha1.NetworkPartitionParams{Direction: "Both"}
+	}
+
+	holdSec := durationSeconds(req.Experiment.Spec.Duration)
+	result := InjectResult{}
+	for idx := range req.Targets {
+		target := &req.Targets[idx]
+		if target.Status.PodIP == "" {
+			return result, fmt.Errorf("pod %s has no IP — not yet running", target.Name)
+		}
+		sidecar := buildPartitionSidecar(req.Experiment, target, params, holdSec)
+		if err := i.deps.Client.Create(ctx, sidecar); err != nil {
+			return result, fmt.Errorf("inject network partition on %s: %w", target.Name, err)
+		}
+		result.AffectedPods = append(result.AffectedPods, target.Name)
+		result.Artifacts = append(result.Artifacts, sidecar.Name)
+		logger.Info("network partition injected", "target", target.Name, "direction", params.Direction, "peers", params.PeerCIDRs)
+		time.Sleep(200 * time.Millisecond)
+	}
+	return result, nil
+}
+
+func (i *NetworkPartitionInjector) Rollback(ctx context.Context, req RollbackRequest) error {
+	return rollbackManagedPods(ctx, i.deps.Client, req.Experiment)
+}
+
+func (i *NetworkPartitionInjector) Describe(exp *chaosv1alpha1.ChaosExperiment) string {
+	p := exp.Spec.Fault.NetworkPartition
+	direction := "Both"
+	scope := "all peers"
+	if p != nil {
+		if p.Direction != "" {
+			direction = p.Direction
+		}
+		if len(p.PeerCIDRs) > 0 {
+			scope = strings.Join(p.PeerCIDRs, ",")
+		}
+	}
+	return fmt.Sprintf("DROP %s traffic between %d%% of matching pods and %s (iptables).",
+		direction, blastRadius(exp), scope)
+}
+
+// buildPartitionSidecar builds the iptables partition sidecar for one target.
+func buildPartitionSidecar(exp *chaosv1alpha1.ChaosExperiment, target *corev1.Pod, params *chaosv1alpha1.NetworkPartitionParams, holdSec int) *corev1.Pod {
+	inject, cleanup := buildPartitionRules(target.Status.PodIP, params)
+	name := fmt.Sprintf("chaos-net-part-%s", shortName(target.Name))
+
+	return buildPrivilegedNodeSidecar(privilegedSidecarSpec{
+		exp:        exp,
+		target:     target,
+		name:       name,
+		faultType:  "network-partition",
+		injectCmd:  inject,
+		cleanupCmd: cleanup,
+		holdSec:    holdSec,
+		caps:       []corev1.Capability{"NET_ADMIN", "NET_RAW"},
+	})
+}
+
+// buildPartitionRules returns the (inject, cleanup) iptables command strings
+// for a partition. Egress rules match on source IP (FORWARD -s), ingress on
+// destination IP (FORWARD -d); direction and optional peer CIDRs scope them.
+func buildPartitionRules(podIP string, params *chaosv1alpha1.NetworkPartitionParams) (string, string) {
+	direction := "Both"
+	if params != nil && params.Direction != "" {
+		direction = params.Direction
+	}
+	var peers []string
+	if params != nil {
+		peers = params.PeerCIDRs
+	}
+
+	egress := direction == "Egress" || direction == "Both"
+	ingress := direction == "Ingress" || direction == "Both"
+
+	var inject, cleanup []string
+	addRule := func(chain, flag, peerFlag, peer string) {
+		peerClause := ""
+		if peer != "" {
+			peerClause = fmt.Sprintf(" %s %s", peerFlag, peer)
+		}
+		inject = append(inject, fmt.Sprintf("iptables -I %s %s %s%s -j DROP", chain, flag, podIP, peerClause))
+		cleanup = append(cleanup, fmt.Sprintf("iptables -D %s %s %s%s -j DROP 2>/dev/null || true", chain, flag, podIP, peerClause))
+	}
+
+	// When no peers are specified we partition against everything (peer "").
+	targetPeers := peers
+	if len(targetPeers) == 0 {
+		targetPeers = []string{""}
+	}
+	for _, peer := range targetPeers {
+		if egress {
+			addRule("FORWARD", "-s", "-d", peer)
+		}
+		if ingress {
+			addRule("FORWARD", "-d", "-s", peer)
+		}
+	}
+
+	inject = append(inject, fmt.Sprintf("echo 'Network partition (%s) applied for %s'", direction, podIP))
+	cleanup = append(cleanup, fmt.Sprintf("echo 'Network partition removed for %s'", podIP))
+	return strings.Join(inject, " && "), strings.Join(cleanup, " && ")
+}
+
+// ─── shared sidecar builder ─────────────────────────────────────────────────
+
+type privilegedSidecarSpec struct {
+	exp        *chaosv1alpha1.ChaosExperiment
+	target     *corev1.Pod
+	name       string
+	faultType  string
+	injectCmd  string
+	cleanupCmd string
+	holdSec    int
+	caps       []corev1.Capability
+}
+
+// buildPrivilegedNodeSidecar constructs a hostNetwork/privileged pod pinned to
+// the target's node that injects a fault via an init container and holds it
+// (with trap-based cleanup) for holdSec seconds in the main container.
+func buildPrivilegedNodeSidecar(s privilegedSidecarSpec) *corev1.Pod {
 	privileged := true
-	hostPID := true
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      sidecarName,
-			Namespace: target.Namespace,
-			Labels: map[string]string{
-				"chaos.sharatvikas.io/managed":    "true",
-				"chaos.sharatvikas.io/fault-type": faultType,
-				"chaos.sharatvikas.io/target-pod": target.Name,
-			},
-		},
+	return &corev1.Pod{
+		ObjectMeta: buildChaosPodMeta(s.name, s.target.Namespace, managedLabels(s.exp, s.faultType, s.target.Name)),
 		Spec: corev1.PodSpec{
-			NodeName:      target.Spec.NodeName,
-			HostPID:       hostPID,
+			NodeName:      s.target.Spec.NodeName,
+			HostPID:       true,
 			HostNetwork:   true,
 			RestartPolicy: corev1.RestartPolicyNever,
-			// Tolerate all taints to reach the target node
-			Tolerations: []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
+			Tolerations:   []corev1.Toleration{{Operator: corev1.TolerationOpExists}},
 			InitContainers: []corev1.Container{
 				{
-					Name:  "inject",
-					Image: "ghcr.io/sharatvikas/chaos-tc:latest",
-					Command: []string{"/bin/sh", "-c", strings.Join([]string{
-						// Wait for pod IP to be routable
-						fmt.Sprintf("until ping -c1 -W1 %s &>/dev/null; do sleep 1; done", target.Status.PodIP),
-						tcCommand,
-						fmt.Sprintf("echo 'Network %s injected on %s (%s)'", faultType, target.Name, target.Status.PodIP),
-					}, " && ")},
-					SecurityContext: &corev1.SecurityContext{
-						Privileged: &privileged,
-						Capabilities: &corev1.Capabilities{
-							Add: []corev1.Capability{"NET_ADMIN", "SYS_ADMIN"},
-						},
-					},
+					Name:            "inject",
+					Image:           netToolsImage,
+					Command:         []string{"/bin/sh", "-c", s.injectCmd},
+					SecurityContext: privilegedSecurityContext(privileged, s.caps),
 				},
 			},
 			Containers: []corev1.Container{
 				{
 					Name:  "hold",
-					Image: "ghcr.io/sharatvikas/chaos-tc:latest",
+					Image: netToolsImage,
 					Command: []string{"/bin/sh", "-c", fmt.Sprintf(
-						"trap '%s' TERM INT; sleep %s; %s",
-						cleanupCommand, holdDuration, cleanupCommand,
+						"trap '%s' TERM INT; echo 'holding %s for %ds'; sleep %d; %s",
+						s.cleanupCmd, s.faultType, s.holdSec, s.holdSec, s.cleanupCmd,
 					)},
-					SecurityContext: &corev1.SecurityContext{
-						Privileged: &privileged,
-						Capabilities: &corev1.Capabilities{
-							Add: []corev1.Capability{"NET_ADMIN"},
-						},
-					},
+					SecurityContext: privilegedSecurityContext(privileged, s.caps),
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
 							corev1.ResourceCPU:    resource.MustParse("10m"),
@@ -123,7 +281,7 @@ func (e *Executor) injectNetworkFault(
 					Lifecycle: &corev1.Lifecycle{
 						PreStop: &corev1.LifecycleHandler{
 							Exec: &corev1.ExecAction{
-								Command: []string{"/bin/sh", "-c", cleanupCommand},
+								Command: []string{"/bin/sh", "-c", s.cleanupCmd},
 							},
 						},
 					},
@@ -131,59 +289,21 @@ func (e *Executor) injectNetworkFault(
 			},
 		},
 	}
-
-	return e.client.Create(ctx, pod)
 }
 
-// buildTCCommand builds the `tc` netem delay command string.
-// Uses netem qdisc for realistic network impairment simulation.
-func buildTCCommand(podIP string, delay *chaosv1alpha1.NetworkDelayParams) string {
-	latency := 200
-	jitter := 20
-	correlation := 25
-	if delay != nil {
-		latency = delay.LatencyMs
-		jitter = delay.JitterMs
-		correlation = delay.CorrelationPct
+func privilegedSecurityContext(privileged bool, caps []corev1.Capability) *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		Privileged:   &privileged,
+		Capabilities: &corev1.Capabilities{Add: caps},
 	}
-	// distribution normal gives more realistic latency distribution than uniform
-	netemArgs := fmt.Sprintf("delay %dms %dms %d%% distribution normal", latency, jitter, correlation)
-
-	// Apply netem only to traffic FROM the target pod IP using u32 filter:
-	// 1. Add prio qdisc as root (allows multiple filters)
-	// 2. Add netem as child on band 1
-	// 3. Add u32 filter matching source IP → redirect to netem band
-	return strings.Join([]string{
-		"tc qdisc add dev eth0 root handle 1: prio priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",
-		fmt.Sprintf("tc qdisc add dev eth0 parent 1:1 handle 10: netem %s", netemArgs),
-		fmt.Sprintf("tc filter add dev eth0 parent 1:0 protocol ip u32 match ip src %s/32 flowid 1:1", podIP),
-	}, " && ")
 }
 
-// stopNetworkFaults removes all chaos sidecar pods injecting network faults for an experiment.
-func (e *Executor) stopNetworkFaults(ctx context.Context, namespace string) error {
-	var podList corev1.PodList
-	if err := e.client.List(ctx, &podList,
-		client.InNamespace(namespace),
-		client.MatchingLabels{"chaos.sharatvikas.io/managed": "true"},
-	); err != nil {
-		return err
+// durationSeconds parses a Duration string into whole seconds, defaulting to
+// 300s (5m) when unparseable — the sidecar hold time must never be zero.
+func durationSeconds(d string) int {
+	dur, err := time.ParseDuration(d)
+	if err != nil || dur <= 0 {
+		return 300
 	}
-
-	gracePeriod := int64(0)
-	for _, pod := range podList.Items {
-		if err := e.client.Delete(ctx, &pod, &client.DeleteOptions{
-			GracePeriodSeconds: &gracePeriod,
-		}); err != nil {
-			return fmt.Errorf("delete chaos pod %s: %w", pod.Name, err)
-		}
-	}
-	return nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return int(dur.Seconds())
 }

@@ -27,9 +27,9 @@ spec:
         - name: Fault
           type: string
           jsonPath: .spec.fault.type
-        - name: Targets
-          type: integer
-          jsonPath: .status.targetedPods
+        - name: Duration
+          type: string
+          jsonPath: .spec.duration
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
@@ -43,63 +43,132 @@ spec:
               properties:
                 target:
                   type: object
-                  required: ["labelSelector"]
+                  required: ["selector", "namespace"]
                   properties:
-                    labelSelector:
+                    selector:
                       type: object
-                      additionalProperties:
-                        type: string
+                      description: Standard Kubernetes label selector for target pods.
+                      properties:
+                        matchLabels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        matchExpressions:
+                          type: array
+                          items:
+                            type: object
+                            required: ["key", "operator"]
+                            properties:
+                              key:
+                                type: string
+                              operator:
+                                type: string
+                              values:
+                                type: array
+                                items:
+                                  type: string
                     namespace:
                       type: string
+                      default: default
                     percentage:
                       type: integer
                       minimum: 1
                       maximum: 100
-                      default: 25
+                      default: 50
                     mode:
                       type: string
-                      enum: ["random", "all", "fixed"]
-                      default: random
+                      enum: ["Random", "All", "Fixed"]
+                      default: Random
+                    minHealthyReplicas:
+                      type: integer
+                      minimum: 0
+                      description: >
+                        Preflight guard — block the experiment if injecting the
+                        fault would leave fewer than this many running,
+                        unaffected pods. 0 disables the guard.
                 fault:
                   type: object
                   required: ["type"]
                   properties:
                     type:
                       type: string
-                      enum: ["PodKill", "CPUStress", "MemoryStress", "NetworkDelay", "NetworkLoss"]
+                      enum:
+                        - PodKill
+                        - ContainerKill
+                        - NetworkDelay
+                        - NetworkPartition
+                        - CPUStress
+                        - MemoryStress
+                        - DNSFailure
+                        - DiskFill
+                        - NodeDrain
                     podKill:
                       type: object
                       properties:
                         gracePeriodSeconds:
                           type: integer
+                          format: int64
+                          minimum: 0
                           default: 0
-                    cpuStress:
+                    containerKill:
                       type: object
                       properties:
-                        workers:
+                        containerName:
+                          type: string
+                        signal:
+                          type: string
+                          enum: ["SIGKILL", "SIGTERM"]
+                          default: SIGKILL
+                    networkDelay:
+                      type: object
+                      required: ["latencyMs"]
+                      properties:
+                        latencyMs:
                           type: integer
-                          default: 1
+                          minimum: 1
+                        jitterMs:
+                          type: integer
+                        correlationPct:
+                          type: integer
+                    networkPartition:
+                      type: object
+                      properties:
+                        direction:
+                          type: string
+                          enum: ["Egress", "Ingress", "Both"]
+                          default: Both
+                        peerCIDRs:
+                          type: array
+                          items:
+                            type: string
+                    cpuStress:
+                      type: object
+                      required: ["cores", "load"]
+                      properties:
+                        cores:
+                          type: integer
+                          minimum: 1
                         load:
                           type: integer
                           minimum: 1
                           maximum: 100
-                          default: 80
                     memoryStress:
                       type: object
+                      required: ["memoryMB"]
                       properties:
-                        workers:
+                        memoryMB:
                           type: integer
-                          default: 1
-                        bytes:
-                          type: string
-                          default: "256M"
+                          minimum: 64
+                        fillPercentage:
+                          type: integer
+                          maximum: 95
                 duration:
                   type: string
                   pattern: '^[0-9]+(s|m|h)$'
                 cooldown:
                   type: string
                   pattern: '^[0-9]+(s|m|h)$'
-                  default: "5m"
+                  default: "2m"
                 dryRun:
                   type: boolean
                   default: false
@@ -111,13 +180,31 @@ spec:
                     properties:
                       type:
                         type: string
-                        enum: ["SLOBurnRate", "ErrorRate", "Availability", "Custom"]
+                        enum: ["SLOBurnRate", "ErrorRate", "Availability"]
                       service:
                         type: string
                       threshold:
                         type: string
                       prometheusQuery:
                         type: string
+                schedule:
+                  type: object
+                  required: ["cron"]
+                  properties:
+                    cron:
+                      type: string
+                    timezone:
+                      type: string
+                      default: UTC
+                    suspend:
+                      type: boolean
+                notifications:
+                  type: object
+                  properties:
+                    slack:
+                      type: string
+                    pagerduty:
+                      type: boolean
             status:
               type: object
               properties:
@@ -130,10 +217,37 @@ spec:
                   type: string
                   format: date-time
                 targetedPods:
-                  type: integer
+                  type: array
+                  items:
+                    type: string
                 abortReason:
                   type: string
+                blockedReason:
+                  type: string
+                dryRunReport:
+                  type: string
+                report:
+                  type: string
+                lastScheduledTime:
+                  type: string
+                  format: date-time
                 conditions:
                   type: array
                   items:
                     type: object
+                    required: ["type", "status", "lastTransitionTime", "reason", "message"]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                        format: int64

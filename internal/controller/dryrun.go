@@ -26,15 +26,15 @@ import (
 
 // DryRunReport is the result of a dry-run simulation.
 type DryRunReport struct {
-	SimulatedAt      time.Time         `json:"simulated_at"`
-	FaultType        string            `json:"fault_type"`
-	WouldTargetPods  []string          `json:"would_target_pods"`
-	WouldBlastRadius int               `json:"would_blast_radius_pct"`
-	WouldDurationSec int               `json:"would_duration_sec"`
+	SimulatedAt       time.Time         `json:"simulated_at"`
+	FaultType         string            `json:"fault_type"`
+	WouldTargetPods   []string          `json:"would_target_pods"`
+	WouldBlastRadius  int               `json:"would_blast_radius_pct"`
+	WouldDurationSec  int               `json:"would_duration_sec"`
 	SafetyGateResults []GateCheckResult `json:"safety_gate_results"`
-	WouldProceed     bool              `json:"would_proceed"`
-	BlockedReason    string            `json:"blocked_reason,omitempty"`
-	EstimatedImpact  string            `json:"estimated_impact"`
+	WouldProceed      bool              `json:"would_proceed"`
+	BlockedReason     string            `json:"blocked_reason,omitempty"`
+	EstimatedImpact   string            `json:"estimated_impact"`
 }
 
 // GateCheckResult captures a single preflight safety gate evaluation.
@@ -175,6 +175,24 @@ func estimateImpact(exp *chaosv1alpha1.ChaosExperiment, targets []string) string
 		return fmt.Sprintf(
 			"Would block DNS on %d pod(s) for %s. Service discovery and external API calls will fail.",
 			len(targets), exp.Spec.Duration,
+		)
+	case chaosv1alpha1.FaultContainerKill:
+		container := "the first container"
+		if p := exp.Spec.Fault.ContainerKill; p != nil && p.ContainerName != "" {
+			container = "container " + p.ContainerName
+		}
+		return fmt.Sprintf(
+			"Would kill %s in %d pod(s). Kubelet restarts it; readiness gating drains traffic until warm.",
+			container, len(targets),
+		)
+	case chaosv1alpha1.FaultNetworkPartition:
+		scope := "all peers (full isolation)"
+		if p := exp.Spec.Fault.NetworkPartition; p != nil && len(p.PeerCIDRs) > 0 {
+			scope = fmt.Sprintf("peers %v", p.PeerCIDRs)
+		}
+		return fmt.Sprintf(
+			"Would DROP traffic between %d pod(s) and %s for %s. Connection-dependent flows will fail fast.",
+			len(targets), scope, exp.Spec.Duration,
 		)
 	default:
 		return fmt.Sprintf(

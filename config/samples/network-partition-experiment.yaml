@@ -41,11 +41,12 @@ spec:
     mode: All
 
   fault:
-    type: NetworkDelay
-    networkDelay:
-      latencyMs: 10000   # 10s latency = effective partition (TCP timeout)
-      jitterMs: 1000
-      correlationPct: 100
+    type: NetworkPartition
+    networkPartition:
+      direction: Both        # Drop both egress and ingress
+      peerCIDRs:
+        - 10.20.0.0/16       # Partition only from the payments-db subnet;
+                             # omit peerCIDRs to fully isolate the pods.
 
   duration: 10m
   cooldown: 5m

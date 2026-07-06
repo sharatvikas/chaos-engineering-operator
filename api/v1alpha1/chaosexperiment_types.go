@@ -5,17 +5,19 @@ import (
 )
 
 // FaultType defines the type of chaos fault to inject
-// +kubebuilder:validation:Enum=PodKill;NetworkDelay;CPUStress;MemoryStress;DNSFailure;DiskFill;NodeDrain
+// +kubebuilder:validation:Enum=PodKill;ContainerKill;NetworkDelay;NetworkPartition;CPUStress;MemoryStress;DNSFailure;DiskFill;NodeDrain
 type FaultType string
 
 const (
-	FaultPodKill      FaultType = "PodKill"
-	FaultNetworkDelay FaultType = "NetworkDelay"
-	FaultCPUStress    FaultType = "CPUStress"
-	FaultMemoryStress FaultType = "MemoryStress"
-	FaultDNSFailure   FaultType = "DNSFailure"
-	FaultDiskFill     FaultType = "DiskFill"
-	FaultNodeDrain    FaultType = "NodeDrain"
+	FaultPodKill          FaultType = "PodKill"
+	FaultContainerKill    FaultType = "ContainerKill"
+	FaultNetworkDelay     FaultType = "NetworkDelay"
+	FaultNetworkPartition FaultType = "NetworkPartition"
+	FaultCPUStress        FaultType = "CPUStress"
+	FaultMemoryStress     FaultType = "MemoryStress"
+	FaultDNSFailure       FaultType = "DNSFailure"
+	FaultDiskFill         FaultType = "DiskFill"
+	FaultNodeDrain        FaultType = "NodeDrain"
 )
 
 // ExperimentPhase represents the current phase of the experiment
@@ -85,6 +87,13 @@ type TargetSpec struct {
 	// +kubebuilder:validation:Enum=Random;All;Fixed
 	// +kubebuilder:default=Random
 	Mode string `json:"mode,omitempty"`
+
+	// MinHealthyReplicas is a preflight safety guard: the experiment is
+	// blocked if injecting the fault would leave fewer than this many
+	// running, unaffected pods behind. Set to 0 (default) to disable.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	MinHealthyReplicas int `json:"minHealthyReplicas,omitempty"`
 }
 
 // FaultSpec defines the type and parameters of the fault
@@ -92,9 +101,21 @@ type FaultSpec struct {
 	// Type is the kind of fault to inject
 	Type FaultType `json:"type"`
 
+	// PodKill parameters (used when Type=PodKill)
+	// +optional
+	PodKill *PodKillParams `json:"podKill,omitempty"`
+
+	// ContainerKill parameters (used when Type=ContainerKill)
+	// +optional
+	ContainerKill *ContainerKillParams `json:"containerKill,omitempty"`
+
 	// NetworkDelay parameters (used when Type=NetworkDelay)
 	// +optional
 	NetworkDelay *NetworkDelayParams `json:"networkDelay,omitempty"`
+
+	// NetworkPartition parameters (used when Type=NetworkPartition)
+	// +optional
+	NetworkPartition *NetworkPartitionParams `json:"networkPartition,omitempty"`
 
 	// CPUStress parameters (used when Type=CPUStress)
 	// +optional
@@ -103,6 +124,48 @@ type FaultSpec struct {
 	// MemoryStress parameters (used when Type=MemoryStress)
 	// +optional
 	MemoryStress *MemoryStressParams `json:"memoryStress,omitempty"`
+}
+
+// PodKillParams configures pod deletion
+type PodKillParams struct {
+	// GracePeriodSeconds is the termination grace period for the killed pod.
+	// 0 (default) is a hard kill that simulates an abrupt node/process failure.
+	// +optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=0
+	GracePeriodSeconds *int64 `json:"gracePeriodSeconds,omitempty"`
+}
+
+// ContainerKillParams configures killing a single container inside a pod
+// (rather than deleting the whole pod). The kubelet restarts the container,
+// which exercises restart handling, readiness gating, and warm-cache loss.
+type ContainerKillParams struct {
+	// ContainerName is the container to kill. Empty selects the first
+	// container in the pod spec.
+	// +optional
+	ContainerName string `json:"containerName,omitempty"`
+
+	// Signal is the signal delivered to the container's PID 1.
+	// +optional
+	// +kubebuilder:validation:Enum=SIGKILL;SIGTERM
+	// +kubebuilder:default=SIGKILL
+	Signal string `json:"signal,omitempty"`
+}
+
+// NetworkPartitionParams configures a full network partition, dropping all
+// traffic (not just delaying it) between the target pods and their peers.
+type NetworkPartitionParams struct {
+	// Direction controls which traffic is dropped relative to the target pod.
+	// +optional
+	// +kubebuilder:validation:Enum=Egress;Ingress;Both
+	// +kubebuilder:default=Both
+	Direction string `json:"direction,omitempty"`
+
+	// PeerCIDRs optionally restricts the partition to traffic to/from these
+	// CIDR blocks (e.g. the database subnet). When empty, ALL traffic is
+	// dropped, fully isolating the target pods.
+	// +optional
+	PeerCIDRs []string `json:"peerCIDRs,omitempty"`
 }
 
 // NetworkDelayParams configures network latency injection

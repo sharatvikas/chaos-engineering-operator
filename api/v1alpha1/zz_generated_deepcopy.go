@@ -100,10 +100,25 @@ func (in *TargetSpec) DeepCopyInto(out *TargetSpec) {
 // DeepCopyInto for FaultSpec
 func (in *FaultSpec) DeepCopyInto(out *FaultSpec) {
 	*out = *in
+	if in.PodKill != nil {
+		in, out := &in.PodKill, &out.PodKill
+		*out = new(PodKillParams)
+		(*in).DeepCopyInto(*out)
+	}
+	if in.ContainerKill != nil {
+		in, out := &in.ContainerKill, &out.ContainerKill
+		*out = new(ContainerKillParams)
+		**out = **in
+	}
 	if in.NetworkDelay != nil {
 		in, out := &in.NetworkDelay, &out.NetworkDelay
 		*out = new(NetworkDelayParams)
 		**out = **in
+	}
+	if in.NetworkPartition != nil {
+		in, out := &in.NetworkPartition, &out.NetworkPartition
+		*out = new(NetworkPartitionParams)
+		(*in).DeepCopyInto(*out)
 	}
 	if in.CPUStress != nil {
 		in, out := &in.CPUStress, &out.CPUStress
@@ -115,6 +130,91 @@ func (in *FaultSpec) DeepCopyInto(out *FaultSpec) {
 		*out = new(MemoryStressParams)
 		**out = **in
 	}
+}
+
+// DeepCopyInto for PodKillParams
+func (in *PodKillParams) DeepCopyInto(out *PodKillParams) {
+	*out = *in
+	if in.GracePeriodSeconds != nil {
+		in, out := &in.GracePeriodSeconds, &out.GracePeriodSeconds
+		*out = new(int64)
+		**out = **in
+	}
+}
+
+// DeepCopy for PodKillParams
+func (in *PodKillParams) DeepCopy() *PodKillParams {
+	if in == nil {
+		return nil
+	}
+	out := new(PodKillParams)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto for ContainerKillParams
+func (in *ContainerKillParams) DeepCopyInto(out *ContainerKillParams) {
+	*out = *in
+}
+
+// DeepCopy for ContainerKillParams
+func (in *ContainerKillParams) DeepCopy() *ContainerKillParams {
+	if in == nil {
+		return nil
+	}
+	out := new(ContainerKillParams)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopyInto for NetworkPartitionParams
+func (in *NetworkPartitionParams) DeepCopyInto(out *NetworkPartitionParams) {
+	*out = *in
+	if in.PeerCIDRs != nil {
+		in, out := &in.PeerCIDRs, &out.PeerCIDRs
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
+}
+
+// DeepCopy for NetworkPartitionParams
+func (in *NetworkPartitionParams) DeepCopy() *NetworkPartitionParams {
+	if in == nil {
+		return nil
+	}
+	out := new(NetworkPartitionParams)
+	in.DeepCopyInto(out)
+	return out
+}
+
+// DeepCopy for NetworkDelayParams
+func (in *NetworkDelayParams) DeepCopy() *NetworkDelayParams {
+	if in == nil {
+		return nil
+	}
+	out := new(NetworkDelayParams)
+	*out = *in
+	return out
+}
+
+// DeepCopy for CPUStressParams
+func (in *CPUStressParams) DeepCopy() *CPUStressParams {
+	if in == nil {
+		return nil
+	}
+	out := new(CPUStressParams)
+	*out = *in
+	return out
+}
+
+// DeepCopy for MemoryStressParams
+func (in *MemoryStressParams) DeepCopy() *MemoryStressParams {
+	if in == nil {
+		return nil
+	}
+	out := new(MemoryStressParams)
+	*out = *in
+	return out
 }
 
 // DeepCopyInto for ChaosExperimentStatus
