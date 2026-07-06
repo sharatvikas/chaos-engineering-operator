@@ -82,7 +82,7 @@ func (i *NetworkDelayInjector) Describe(exp *chaosv1alpha1.ChaosExperiment) stri
 func buildNetemSidecar(exp *chaosv1alpha1.ChaosExperiment, target *corev1.Pod, params *chaosv1alpha1.NetworkDelayParams, holdSec int) *corev1.Pod {
 	injectCmd := buildTCCommand(target.Status.PodIP, params)
 	cleanupCmd := "tc qdisc del dev eth0 root 2>/dev/null; tc filter del dev eth0 2>/dev/null || true"
-	name := fmt.Sprintf("chaos-net-delay-%s", shortName(target.Name))
+	name := chaosArtifactName("chaos-net-delay", exp, target)
 
 	return buildPrivilegedNodeSidecar(privilegedSidecarSpec{
 		exp:        exp,
@@ -170,7 +170,7 @@ func (i *NetworkPartitionInjector) Describe(exp *chaosv1alpha1.ChaosExperiment) 
 // buildPartitionSidecar builds the iptables partition sidecar for one target.
 func buildPartitionSidecar(exp *chaosv1alpha1.ChaosExperiment, target *corev1.Pod, params *chaosv1alpha1.NetworkPartitionParams, holdSec int) *corev1.Pod {
 	inject, cleanup := buildPartitionRules(target.Status.PodIP, params)
-	name := fmt.Sprintf("chaos-net-part-%s", shortName(target.Name))
+	name := chaosArtifactName("chaos-net-part", exp, target)
 
 	return buildPrivilegedNodeSidecar(privilegedSidecarSpec{
 		exp:        exp,

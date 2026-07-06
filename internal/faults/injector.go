@@ -21,7 +21,10 @@ package faults
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -183,13 +186,47 @@ func rollbackManagedPods(ctx context.Context, c client.Client, exp *chaosv1alpha
 	return firstErr
 }
 
-// shortName truncates a name for embedding in a generated pod name so the
-// result stays within Kubernetes' 63-character limit.
-func shortName(name string) string {
-	if len(name) <= 40 {
-		return name
+// artifactHashLen is the number of hex characters of the disambiguating hash
+// appended to every generated chaos-artifact name.
+const artifactHashLen = 8
+
+// maxArtifactNameLen is Kubernetes' DNS-1123 *label* limit — the tightest
+// constraint on a pod name (pod names are also used as label values elsewhere,
+// and must be <= 63 chars to remain valid selectors).
+const maxArtifactNameLen = 63
+
+// chaosArtifactName builds a deterministic, collision-free name for a chaos
+// artifact created for (experiment, target). The result is
+//
+//	<prefix>-<truncated-target>-<hash>
+//
+// where <prefix> encodes the fault family (e.g. "chaos-cpu") and <hash> is
+// derived from the experiment identity (namespace+name), the target pod, and
+// the prefix. Two ChaosExperiments injecting the SAME fault into the SAME
+// target therefore produce DISTINCT names (their experiment names differ), so
+// their artifacts never collide on create. The name is a pure function of its
+// inputs, so it is stable across reconciles — though rollback selects purely by
+// label (see rollbackManagedPods) and does not depend on the name at all.
+//
+// The result is always a valid DNS-1123 label of at most 63 characters: the
+// prefix and hash are lowercase alphanumerics/'-', pod names are already
+// DNS-1123, and the trailing hash guarantees the last character is alphanumeric
+// even when the target component is truncated.
+func chaosArtifactName(prefix string, exp *chaosv1alpha1.ChaosExperiment, target *corev1.Pod) string {
+	sum := sha1.Sum([]byte(strings.Join([]string{exp.Namespace, exp.Name, target.Name, prefix}, "/")))
+	hash := hex.EncodeToString(sum[:])[:artifactHashLen]
+
+	// Reserve room for the prefix, the hash, and the two "-" separators; the
+	// remaining budget is filled by a truncated target name.
+	budget := maxArtifactNameLen - len(prefix) - artifactHashLen - 2
+	if budget < 0 {
+		budget = 0
 	}
-	return name[:40]
+	targetPart := target.Name
+	if len(targetPart) > budget {
+		targetPart = targetPart[:budget]
+	}
+	return fmt.Sprintf("%s-%s-%s", prefix, targetPart, hash)
 }
 
 // buildChaosPodMeta builds the ObjectMeta shared by all sidecar chaos pods.

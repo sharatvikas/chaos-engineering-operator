@@ -83,7 +83,7 @@ func buildDNSSidecar(exp *chaosv1alpha1.ChaosExperiment, target *corev1.Pod, hol
 	sidecar := buildPrivilegedNodeSidecar(privilegedSidecarSpec{
 		exp:        exp,
 		target:     target,
-		name:       fmt.Sprintf("chaos-dns-%s", shortName(target.Name)),
+		name:       chaosArtifactName("chaos-dns", exp, target),
 		faultType:  "dns-failure",
 		injectCmd:  inject,
 		cleanupCmd: cleanup,

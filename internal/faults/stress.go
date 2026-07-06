@@ -38,7 +38,7 @@ func (i *CPUStressInjector) Inject(ctx context.Context, req InjectRequest) (Inje
 		stressPod := buildStressPod(
 			req.Experiment,
 			target,
-			fmt.Sprintf("chaos-cpu-%s", shortName(target.Name)),
+			chaosArtifactName("chaos-cpu", req.Experiment, target),
 			"cpu-stress",
 			[]string{
 				"stress-ng",
@@ -94,7 +94,7 @@ func (i *MemoryStressInjector) Inject(ctx context.Context, req InjectRequest) (I
 		stressPod := buildStressPod(
 			req.Experiment,
 			target,
-			fmt.Sprintf("chaos-mem-%s", shortName(target.Name)),
+			chaosArtifactName("chaos-mem", req.Experiment, target),
 			"memory-stress",
 			[]string{"stress-ng", "--vm", "1", "--vm-bytes", vmBytes},
 		)

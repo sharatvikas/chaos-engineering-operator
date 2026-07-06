@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -222,6 +223,120 @@ func TestRollbackDoesNotTouchOtherExperiments(t *testing.T) {
 	_ = c.List(context.Background(), &pods, client.MatchingLabels{LabelExperiment: "exp-b"})
 	if len(pods.Items) != 1 {
 		t.Errorf("expected exp-b artifact untouched, got %d", len(pods.Items))
+	}
+}
+
+// ─── Same-pod / same-fault artifact-name uniqueness ─────────────────────────
+
+// artifactNamesFor returns the names of the chaos artifacts labelled to exp.
+func artifactNamesFor(t *testing.T, c client.Client, expName string) []string {
+	t.Helper()
+	var pods corev1.PodList
+	if err := c.List(context.Background(), &pods,
+		client.MatchingLabels{LabelManaged: "true", LabelExperiment: expName}); err != nil {
+		t.Fatalf("list artifacts for %s: %v", expName, err)
+	}
+	names := make([]string, 0, len(pods.Items))
+	for i := range pods.Items {
+		names = append(names, pods.Items[i].Name)
+	}
+	return names
+}
+
+// TestSamePodSameFaultProducesDistinctArtifactNames is the regression test for
+// the collision bug: two experiments injecting the SAME fault into the SAME
+// target pod must create artifacts with DISTINCT, DNS-1123-valid names (so the
+// second create no longer fails with "already exists"), and rollback must still
+// resolve each experiment's own artifacts by label.
+func TestSamePodSameFaultProducesDistinctArtifactNames(t *testing.T) {
+	ctx := context.Background()
+	pod := runningPod("svc-1")
+	c := newFakeClient(pod)
+	e := NewExecutor(c)
+
+	expA := experiment(chaosv1alpha1.FaultCPUStress)
+	expA.Name = "exp-alpha"
+	expA.Spec.Fault.CPUStress = &chaosv1alpha1.CPUStressParams{Cores: 1, Load: 50}
+	expB := experiment(chaosv1alpha1.FaultCPUStress)
+	expB.Name = "exp-bravo"
+	expB.Spec.Fault.CPUStress = &chaosv1alpha1.CPUStressParams{Cores: 1, Load: 50}
+
+	if _, err := e.Start(ctx, expA); err != nil {
+		t.Fatalf("start exp-alpha: %v", err)
+	}
+	// Before the fix this failed: the artifact name derived from the target
+	// only, so the second create collided with the first.
+	if _, err := e.Start(ctx, expB); err != nil {
+		t.Fatalf("second experiment on same pod+fault must not collide: %v", err)
+	}
+
+	namesA := artifactNamesFor(t, c, "exp-alpha")
+	namesB := artifactNamesFor(t, c, "exp-bravo")
+	if len(namesA) != 1 || len(namesB) != 1 {
+		t.Fatalf("expected 1 artifact per experiment, got A=%v B=%v", namesA, namesB)
+	}
+	if namesA[0] == namesB[0] {
+		t.Fatalf("artifact names collide across experiments: %q", namesA[0])
+	}
+	for _, n := range append(namesA, namesB...) {
+		if len(n) > 63 {
+			t.Errorf("artifact name %q exceeds 63 chars (%d)", n, len(n))
+		}
+		if errs := validation.IsDNS1123Label(n); len(errs) > 0 {
+			t.Errorf("artifact name %q is not a valid DNS-1123 label: %v", n, errs)
+		}
+	}
+
+	// Rolling back exp-alpha must remove only its own artifact; exp-bravo's
+	// artifact (same fault, same target) must survive — rollback is label-scoped.
+	if err := e.Stop(ctx, expA); err != nil {
+		t.Fatalf("stop exp-alpha: %v", err)
+	}
+	if remaining := artifactNamesFor(t, c, "exp-alpha"); len(remaining) != 0 {
+		t.Errorf("expected exp-alpha artifacts removed, got %v", remaining)
+	}
+	if remaining := artifactNamesFor(t, c, "exp-bravo"); len(remaining) != 1 {
+		t.Errorf("expected exp-bravo artifact untouched, got %v", remaining)
+	}
+	if err := e.Stop(ctx, expB); err != nil {
+		t.Fatalf("stop exp-bravo: %v", err)
+	}
+	if remaining := artifactNamesFor(t, c, "exp-bravo"); len(remaining) != 0 {
+		t.Errorf("expected exp-bravo artifacts removed after its own rollback, got %v", remaining)
+	}
+}
+
+// TestChaosArtifactNameStaysWithinLimits verifies the name stays a valid
+// DNS-1123 label <=63 chars even with a maximal-length target pod name, and
+// that it remains deterministic and distinct per experiment.
+func TestChaosArtifactNameStaysWithinLimits(t *testing.T) {
+	longTarget := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		// 63-char pod name (the K8s maximum for a pod).
+		Name:      "workload-with-a-very-long-generated-hash-suffix-abcdefghijklmn0",
+		Namespace: "team-a",
+	}}
+	expA := experiment(chaosv1alpha1.FaultNetworkDelay)
+	expA.Name = "experiment-with-a-fairly-long-descriptive-name-alpha"
+	expB := experiment(chaosv1alpha1.FaultNetworkDelay)
+	expB.Name = "experiment-with-a-fairly-long-descriptive-name-bravo"
+
+	nameA := chaosArtifactName("chaos-net-delay", expA, longTarget)
+	nameB := chaosArtifactName("chaos-net-delay", expB, longTarget)
+
+	for _, n := range []string{nameA, nameB} {
+		if len(n) > 63 {
+			t.Errorf("name %q exceeds 63 chars (%d)", n, len(n))
+		}
+		if errs := validation.IsDNS1123Label(n); len(errs) > 0 {
+			t.Errorf("name %q not a valid DNS-1123 label: %v", n, errs)
+		}
+	}
+	if nameA == nameB {
+		t.Errorf("distinct experiments produced identical names: %q", nameA)
+	}
+	// Deterministic: same inputs → same name (rollback lookups stay stable).
+	if again := chaosArtifactName("chaos-net-delay", expA, longTarget); again != nameA {
+		t.Errorf("name not deterministic: %q vs %q", nameA, again)
 	}
 }
 

@@ -95,6 +95,13 @@ Every artifact the operator creates is labelled with
 `chaos.sharatvikas.io/experiment=<name>`, so rollback deletes **only** the pods
 that experiment created — concurrent experiments never disturb each other.
 
+Artifact **names** are `<fault-prefix>-<truncated-target>-<hash>`, where the
+hash is a deterministic digest of the experiment identity, the target pod, and
+the fault family. Two experiments injecting the same fault into the same target
+therefore get distinct names and never collide on create, while the name stays
+stable across reconciles. Names are always valid DNS-1123 labels ≤ 63 chars.
+Rollback selects purely by label, so it is unaffected by the naming scheme.
+
 ---
 
 ## Safety Architecture
