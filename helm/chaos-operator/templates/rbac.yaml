@@ -22,13 +22,13 @@ metadata:
     {{- include "chaos-operator.labels" . | nindent 4 }}
 rules:
   # ChaosExperiment CRDs
-  - apiGroups: ["chaos.k8s-ai-ops.io"]
+  - apiGroups: ["chaos.sharatvikas.io"]
     resources: ["chaosexperiments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["chaos.k8s-ai-ops.io"]
+  - apiGroups: ["chaos.sharatvikas.io"]
     resources: ["chaosexperiments/status"]
     verbs: ["get", "update", "patch"]
-  - apiGroups: ["chaos.k8s-ai-ops.io"]
+  - apiGroups: ["chaos.sharatvikas.io"]
     resources: ["chaosexperiments/finalizers"]
     verbs: ["update"]
 

@@ -243,7 +243,11 @@ func (r *ChaosExperimentReconciler) abort(ctx context.Context, exp *chaosv1alpha
 func (r *ChaosExperimentReconciler) setPhase(ctx context.Context, exp *chaosv1alpha1.ChaosExperiment, phase string) (ctrl.Result, error) {
 	patch := client.MergeFrom(exp.DeepCopy())
 	exp.Status.Phase = chaosv1alpha1.ExperimentPhase(phase)
-	if phase == "Completed" {
+	// Record EndTime when faults stop. handleCooldown reads EndTime as the
+	// cooldown start; without stamping it on the Running->Cooldown transition
+	// the cooldown timer resets to now() every reconcile and never elapses,
+	// stranding the experiment in Cooldown. Completed is also stamped here.
+	if (phase == "Cooldown" || phase == "Completed") && exp.Status.EndTime == nil {
 		now := metav1.Now()
 		exp.Status.EndTime = &now
 	}

@@ -1,0 +1,28 @@
+# Happy-path PodKill experiment.
+# Kills 50% (2 of 4) of demo-target pods, guarded so it never drops below
+# 2 healthy replicas, and gated on a live Prometheus SLO burn-rate query.
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: demo-target-pod-kill
+  namespace: chaos-demo
+spec:
+  target:
+    selector:
+      matchLabels:
+        app: demo-target
+    namespace: chaos-demo
+    percentage: 50
+    mode: Random
+    minHealthyReplicas: 2      # preflight guard: keep >= 2 running
+  fault:
+    type: PodKill
+    podKill:
+      gracePeriodSeconds: 0    # hard kill
+  duration: 20s
+  cooldown: 15s
+  safetyGates:
+    - type: SLOBurnRate         # live Prometheus query (in-cluster)
+      service: demo-target
+      threshold: "5x"
+  dryRun: false

@@ -1,0 +1,23 @@
+# Guard demo #1: violates the min-healthy-replicas preflight guard.
+# Targets 100% of 4 pods while requiring >= 3 to stay healthy -> BLOCKED.
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: guard-minhealthy-violation
+  namespace: chaos-demo
+spec:
+  target:
+    selector:
+      matchLabels:
+        app: demo-target
+    namespace: chaos-demo
+    percentage: 100
+    mode: All
+    minHealthyReplicas: 3      # 4 running - 4 affected = 0 < 3 -> refused
+  fault:
+    type: PodKill
+    podKill:
+      gracePeriodSeconds: 0
+  duration: 20s
+  cooldown: 10s
+  dryRun: false

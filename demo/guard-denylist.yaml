@@ -1,0 +1,22 @@
+# Guard demo #2: targets a denylisted (protected) namespace.
+# kube-system is on the built-in chaos denylist -> BLOCKED at preflight.
+apiVersion: chaos.sharatvikas.io/v1alpha1
+kind: ChaosExperiment
+metadata:
+  name: guard-denylist-violation
+  namespace: chaos-demo
+spec:
+  target:
+    selector:
+      matchLabels:
+        k8s-app: kube-dns
+    namespace: kube-system      # protected namespace -> refused
+    percentage: 50
+    mode: Random
+  fault:
+    type: PodKill
+    podKill:
+      gracePeriodSeconds: 0
+  duration: 20s
+  cooldown: 10s
+  dryRun: false
