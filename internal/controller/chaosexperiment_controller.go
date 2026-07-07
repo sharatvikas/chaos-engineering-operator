@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -141,8 +142,29 @@ func (r *ChaosExperimentReconciler) handlePreflightCheck(ctx context.Context, ex
 	}
 
 	if exp.Spec.DryRun {
-		logger.Info("dry run — skipping fault injection")
-		return r.setPhase(ctx, exp, "Completed")
+		logger.Info("dry run — simulating experiment without fault injection")
+		report, err := r.runDryRun(ctx, exp)
+		if err != nil {
+			return r.abort(ctx, exp, fmt.Sprintf("dry-run simulation failed: %v", err))
+		}
+
+		patch := client.MergeFrom(exp.DeepCopy())
+		now := metav1.Now()
+		exp.Status.Phase = "Completed"
+		exp.Status.EndTime = &now
+		if data, merrErr := json.Marshal(report); merrErr == nil {
+			exp.Status.DryRunReport = string(data)
+		} else {
+			logger.Error(merrErr, "failed to marshal dry-run report")
+		}
+		meta.SetStatusCondition(&exp.Status.Conditions, metav1.Condition{
+			Type:               "Running",
+			Status:             metav1.ConditionFalse,
+			Reason:             "DryRunCompleted",
+			Message:            fmt.Sprintf("dry-run complete — would_proceed=%v", report.WouldProceed),
+			LastTransitionTime: now,
+		})
+		return ctrl.Result{}, r.Status().Patch(ctx, exp, patch)
 	}
 	return r.startFaults(ctx, exp)
 }
