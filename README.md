@@ -191,6 +191,27 @@ ls config/samples/
 
 ---
 
+## Try it locally
+
+The `demo/` directory runs the operator end-to-end on a real Kubernetes cluster (e.g. [`kind`](https://kind.sigs.k8s.io/)): it deploys the controller, kills real pods of a target Deployment, watches the workload self-heal, and shows the two-layer safety system **refusing** unsafe experiments (min-healthy-replicas and namespace-denylist guards → `Aborted`).
+
+```bash
+# Requires a Kubernetes cluster (e.g. kind). Full step-by-step in demo/README.md.
+docker build -t chaos-operator:demo . && kind load docker-image chaos-operator:demo --name sre-platform
+kubectl create namespace chaos-demo
+kubectl apply -f config/crd/chaosexperiment.yaml
+helm install chaos-operator ./helm/chaos-operator -n chaos-demo \
+  --set image.repository=chaos-operator --set image.tag=demo --set crds.install=false
+kubectl apply -f demo/target-deployment.yaml
+kubectl apply -f demo/podkill-experiment.yaml   # happy path -> Completed
+kubectl apply -f demo/guard-minhealthy.yaml     # blocked  -> Aborted
+kubectl apply -f demo/guard-denylist.yaml       # blocked  -> Aborted
+```
+
+This proves the phase state machine, real fault injection + self-healing, and both preflight safety guards. See [`demo/OUTPUT.md`](demo/OUTPUT.md) for the captured real run and [`demo/README.md`](demo/README.md) for the complete walkthrough.
+
+---
+
 ## Project Structure
 
 ```
