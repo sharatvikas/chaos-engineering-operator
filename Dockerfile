@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for the chaos-engineering-operator controller-manager.
-FROM golang:1.26 AS build
+FROM golang:1.27 AS build
 WORKDIR /workspace
 
 # Cache module downloads
